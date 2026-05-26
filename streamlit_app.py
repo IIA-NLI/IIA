@@ -249,7 +249,7 @@ if check_password():
                 st.warning("Please provide keywords to search for.")
             else:
                 keywords = [k.strip() for k in keywords_query.split(",") if k.strip()]
-                all_links = []
+                all_links = []  # list of (link, keyword) tuples
                 for kw in keywords:
                     q = kw
                     if include_inurl:
@@ -259,11 +259,52 @@ if check_password():
                     except Exception as e:
                         st.error(f"Search failed: {e}")
                         links = []
-                    all_links.extend(links)
+                    all_links.extend([(l, kw) for l in links])
 
-                # Deduplicate and normalize
-                unique_links = list(dict.fromkeys(all_links))
-                st.success(f"Collected {len(unique_links)} unique URLs from search results.")
+                # Normalize to domain roots (scheme://netloc), deduplicate by domain,
+                # remember which keyword produced each domain, and skip existing DB domains.
+                domain_to_keyword = {}
+                root_urls = []
+                seen = set()
+                for link, kw in all_links:
+                    raw = link
+                    if not raw:
+                        continue
+                    if not raw.startswith("http://") and not raw.startswith("https://"):
+                        raw = "http://" + raw
+                    p = urlparse(raw)
+                    # domain netloc normalized (lowercase, no leading www.)
+                    netloc = (p.netloc or "").lower()
+                    if netloc.startswith("www."):
+                        domain_key = netloc[4:]
+                    else:
+                        domain_key = netloc
+
+                    domain_root = f"{p.scheme}://{p.netloc}"
+
+                    # If homepage_only requested, only include original links that were root/homepages
+                    if homepage_only:
+                        path = p.path.rstrip("/")
+                        if path and path != "":
+                            continue
+
+                    if domain_key in seen:
+                        continue
+
+                    # Skip if domain already exists in DB (check normalized domain_key)
+                    try:
+                        if backend.domain_exists(domain_key):
+                            continue
+                    except Exception:
+                        pass
+
+                    seen.add(domain_key)
+                    root_urls.append(domain_root)
+                    # record first-seen keyword for this domain_key
+                    domain_to_keyword[domain_root] = kw
+
+                unique_links = root_urls
+                st.success(f"Collected {len(unique_links)} unique domain roots from search results.")
 
                 # Load good keywords for 'good keyword' rule
                 try:
@@ -280,28 +321,40 @@ if check_password():
                         if path and path != "":
                             continue
 
+                    # annotate source with originating keyword when available
+                    originating_kw = None
+                    try:
+                        originating_kw = domain_to_keyword.get(link)
+                    except Exception:
+                        originating_kw = None
+
                     payload = backend.analyze_and_extract_url(link)
+                    if originating_kw:
+                        payload["source"] = f"Google search for {originating_kw}"
 
-                    # Determine approval rules
-                    approved = False
-                    parsed = urlparse(payload.get("url") or link)
-                    hostname = parsed.hostname or ""
-                    if hostname.lower().endswith(".il"):
-                        approved = True
-
-                    languages = payload.get("languages") or {}
-                    if any(l.lower().startswith("he") for l in languages.keys()):
-                        approved = True
-
-                    # Check for any good keyword present in title/description (original or english)
-                    text_fields = " ".join([str(payload.get(k) or "") for k in ("title", "description", "title_english", "description_english")]).lower()
-                    for gkw in good_kw_list:
-                        if gkw.lower() in text_fields:
+                    # Evaluate payload using backend rules (sets status and status_details)
+                    try:
+                        payload = backend.evaluate_payload(payload, good_keywords=good_kw_list)
+                    except Exception:
+                        # fallback to previous simple behavior
+                        approved = False
+                        parsed = urlparse(payload.get("url") or link)
+                        hostname = parsed.hostname or ""
+                        if hostname.lower().endswith(".il"):
                             approved = True
-                            break
 
-                    payload["status"] = "Approved" if approved else "Not sure"
-                    payload["status_details"] = "Auto-evaluated via keyword search"
+                        languages = payload.get("languages") or {}
+                        if any(l.lower().startswith("he") for l in languages.keys()):
+                            approved = True
+
+                        text_fields = " ".join([str(payload.get(k) or "") for k in ("title", "description", "title_english", "description_english")]).lower()
+                        for gkw in good_kw_list:
+                            if gkw.lower() in text_fields:
+                                approved = True
+                                break
+
+                        payload["status"] = "Approved" if approved else "Not sure"
+                        payload["status_details"] = "Auto-evaluated via keyword search"
                     processed.append(payload)
 
                 # Show processed list and allow user to approve unknowns
@@ -319,34 +372,48 @@ if check_password():
 
                 if unknowns:
                     st.subheader("Review Unknown Results")
-                    approvals = {}
+                    status_options = ["Approved", "Not sure", "Not relevant"]
                     with st.form("unknowns_review_form"):
+                        commit_map = {}
                         for i, p in enumerate(unknowns):
-                            colA, colB = st.columns([6,1])
-                            with colA:
-                                st.markdown(f"**{p['url']}** — {p.get('title') or p.get('title_english') or 'No Title'}")
-                                st.write(p.get('description') or '')
-                                st.caption(f"Detected languages: {p.get('languages')}")
-                            with colB:
-                                approvals[i] = st.checkbox("Approve", key=f"approve_{i}")
+                            with st.expander(f"{p['url']} — {p.get('title') or p.get('title_english') or 'No Title'}", expanded=False):
+                                st.markdown(f"**Original Title:** {p.get('title')}")
+                                st.markdown(f"**English Title:** {p.get('title_english')}")
+                                st.markdown(f"**Original Description:** {p.get('description')}")
+                                st.markdown(f"**English Description:** {p.get('description_english')}")
+                                st.write(f"**Response Code:** `{p.get('response_code')}`")
+                                st.write(f"**Detected languages:** `{p.get('languages')}`")
+                                st.write(f"**Source:** {p.get('source')}")
+
+                                selected_status = st.selectbox("Select Status:", options=status_options, index=status_options.index(p.get('status')) if p.get('status') in status_options else 1, key=f"status_{i}")
+                                status_details = st.text_input("Status Details:", value=p.get('status_details') or "", key=f"details_{i}")
+                                include = st.checkbox("Include in commit", key=f"commit_{i}")
+                                commit_map[i] = {"include": include, "status": selected_status, "details": status_details}
 
                         commit_choices = st.form_submit_button("Commit Selected to Archive")
 
                     if commit_choices:
                         to_commit = []
-                        for idx, approved_flag in approvals.items():
-                            if approved_flag:
+                        for idx, meta in commit_map.items():
+                            if meta.get("include"):
                                 item = unknowns[idx]
-                                item['status'] = 'Approved'
+                                item['status'] = meta.get('status')
+                                if item['status'] == 'Approved':
+                                    item['status_details'] = 'Approved by user'
+                                else:
+                                    item['status_details'] = meta.get('details') or item.get('status_details')
                                 to_commit.append(item)
 
                         if to_commit:
+                            saved = 0
                             for item in to_commit:
                                 try:
                                     backend.insert_domain(item)
+                                    saved += 1
                                 except Exception as e:
                                     st.error(f"Failed to save {item['url']}: {e}")
-                            st.success(f"Saved {len(to_commit)} selected records to the archive.")
+                            if saved:
+                                st.success(f"Saved {saved} selected records to the archive.")
                         else:
                             st.info("No selections made to commit.")
 

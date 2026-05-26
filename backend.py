@@ -196,9 +196,61 @@ class ArchiveBackend:
                     approved = True
                     break
 
+        # Determine status details priority:
+        # 1) good keywords found -> "Found X good keywords"
+        # 2) .il domain -> ".il suffix"
+        # 3) Hebrew detected -> "Hebrew"
+        kw_count = 0
+        if good_keywords:
+            text_fields = " ".join([str(payload.get(k) or "") for k in ("title", "description", "title_english", "description_english")]).lower()
+            for kw in good_keywords:
+                if kw.lower() in text_fields:
+                    kw_count += 1
+
+        if hostname.endswith(".il"):
+            payload["status_details"] = ".il suffix"
+        elif any(str(l).lower().startswith("he") for l in languages.keys()):
+            payload["status_details"] = "Hebrew"
+        elif kw_count > 0:
+            payload["status_details"] = f"Found {kw_count} good keywords"
+        else:
+            payload["status_details"] = "Approved by user"
+
         payload["status"] = "Approved" if approved else "Not sure"
-        payload["status_details"] = "Auto-evaluated"
         return payload
+
+    def domain_exists(self, domain_url: str) -> bool:
+        """Check whether a domain already exists in `DOMAINS`.
+
+        Accepts a normalized domain netloc (no scheme, no leading www), e.g. `example.com`.
+        This will check common stored variants (with http/https and with/without www).
+        """
+        try:
+            # Prepare variants to check against stored `url` column
+            variants = [
+                domain_url,
+                f"http://{domain_url}",
+                f"https://{domain_url}",
+                f"http://www.{domain_url}",
+                f"https://www.{domain_url}",
+                f"www.{domain_url}",
+            ]
+
+            for v in variants:
+                resp = (
+                    self.supabase.table("DOMAINS")
+                    .select("id")
+                    .eq("url", v)
+                    .limit(1)
+                    .execute()
+                )
+                if resp and getattr(resp, 'data', None):
+                    if resp.data:
+                        return True
+
+            return False
+        except Exception:
+            return False
 
     def insert_domain(self, payload: dict):
         """Upserts processed metadata into the DOMAINS table."""
