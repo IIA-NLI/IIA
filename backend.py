@@ -87,7 +87,7 @@ class ArchiveBackend:
                         source="auto", target="en"
                     ).translate(description)
             except Exception:
-                pass  # Keep status_details cleanly defaulted to "Manually added"
+                pass  # Keep status_details safely set to "Manually added"
 
         return {
             "url": url,
@@ -117,7 +117,7 @@ class ArchiveBackend:
         response = (
             self.supabase.table("DOMAINS")
             .select("*")
-            .order("id", descending=True)
+            .order("id", desc=True)
             .execute()
         )
         return response.data
@@ -131,7 +131,7 @@ class ArchiveBackend:
             .or_(
                 f"url.ilike.{match_str},title.ilike.{match_str},description.ilike.{match_str},title_english.ilike.{match_str},description_english.ilike.{match_str}"
             )
-            .order("id", descending=True)
+            .order("id", desc=True)
             .execute()
         )
         return response.data
@@ -154,7 +154,7 @@ class ArchiveBackend:
         if filters.get("response_code"):
             query_builder = query_builder.eq("response_code", filters["response_code"])
 
-        response = query_builder.order("id", descending=True).execute()
+        response = query_builder.order("id", desc=True).execute()
         data = response.data
 
         # Post-filter languages dictionary structure since Supabase stores it as JSONB
@@ -171,35 +171,35 @@ class ArchiveBackend:
     # KEYWORDS TABLE MANAGEMENT
     # =========================================================================
 
-    def insert_keywords(self, words: list, is_good: bool) -> dict:
+    def analyze_keywords_before_saving(self, words: list) -> list:
         """
-        Processes a list of words, detects their language, 
-        and inserts or ignores conflicts into the KEYWORDS table.
+        Splits text input and runs language detection on each word token.
+        Returns an analyzed structured array for UI modification.
         """
-        payloads = []
+        analyzed_list = []
         for word in words:
             word_clean = word.strip()
             if not word_clean:
                 continue
-                
-            # Basic Language Detection for each keyword token
+
             try:
                 predictions = detect_langs(word_clean)
                 detected_langs = {p.lang: round(p.prob, 2) for p in predictions}
             except Exception:
                 detected_langs = {"unknown": 1.0}
 
-            payloads.append({
+            analyzed_list.append({
                 "word": word_clean,
-                "good": is_good,
-                "language": detected_langs  # Saved natively as a structured JSON object
+                "languages_list": list(detected_langs.keys())
             })
+        return analyzed_list
 
+    def insert_final_keywords(self, payloads: list) -> dict:
+        """Saves a prepared and finalized payload batch directly to the database."""
         if not payloads:
-            return {"success": False, "message": "No valid keywords provided."}
+            return {"success": False, "message": "No data provided."}
 
         try:
-            # Upsert on conflict 'word' constraint to handle unique strings gracefully
             response = (
                 self.supabase.table("KEYWORDS")
                 .upsert(payloads, on_conflict="word")
@@ -207,14 +207,14 @@ class ArchiveBackend:
             )
             return {"success": True, "count": len(payloads)}
         except Exception as e:
-            raise Exception(f"Database keyword insertion failed: {str(e)}")
+            raise Exception(f"Database insertion failed: {str(e)}")
 
     def get_all_keywords(self) -> list:
         """Fetches all keywords from the database sorted by generation date."""
         response = (
             self.supabase.table("KEYWORDS")
             .select("*")
-            .order("id", descending=True)
+            .order("id", desc=True)
             .execute()
         )
         return response.data
