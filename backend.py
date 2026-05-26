@@ -16,6 +16,10 @@ class ArchiveBackend:
         self.key = st.secrets["SUPABASE_KEY"]
         self.supabase: Client = create_client(self.url, self.key)
 
+    # =========================================================================
+    # DOMAINS TABLE MANAGEMENT
+    # =========================================================================
+
     def analyze_and_extract_url(self, url: str) -> dict:
         """Scrapes URL, extracts metadata, detects languages, and translates text to English."""
         if not re.match(r"^https?://", url):
@@ -40,7 +44,7 @@ class ArchiveBackend:
                 "description_english": None,
                 "languages": {"error": "Failed to resolve domain"},
                 "status": "Not relevant",
-                "status_details": f"Failed to resolve domain: {str(e)}",
+                "status_details": "Manually added",
                 "source": "manually",
                 "response_code": None,
             }
@@ -82,8 +86,8 @@ class ArchiveBackend:
                     description_english = GoogleTranslator(
                         source="auto", target="en"
                     ).translate(description)
-            except Exception as e:
-                status_details += f" | Translation failed: {str(e)}"
+            except Exception:
+                pass  # Keep status_details cleanly defaulted to "Manually added"
 
         return {
             "url": url,
@@ -108,6 +112,16 @@ class ArchiveBackend:
             .execute()
         )
 
+    def get_all_domains(self) -> list:
+        """Fetches all records from the DOMAINS database table."""
+        response = (
+            self.supabase.table("DOMAINS")
+            .select("*")
+            .order("id", descending=True)
+            .execute()
+        )
+        return response.data
+
     def search_domains(self, query: str) -> list:
         """Queries the database looking for a keyword string across multiple columns."""
         match_str = f"%{query}%"
@@ -121,3 +135,95 @@ class ArchiveBackend:
             .execute()
         )
         return response.data
+
+    def advanced_search_domains(self, filters: dict) -> list:
+        """Executes a compound multi-column advanced filter search query."""
+        query_builder = self.supabase.table("DOMAINS").select("*")
+
+        # Handle text search constraints
+        if filters.get("text_query"):
+            match_str = f"%{filters['text_query']}%"
+            query_builder = query_builder.or_(
+                f"url.ilike.{match_str},title.ilike.{match_str},description.ilike.{match_str},title_english.ilike.{match_str},description_english.ilike.{match_str}"
+            )
+
+        # Handle relational filter tags
+        if filters.get("status"):
+            query_builder = query_builder.eq("status", filters["status"])
+            
+        if filters.get("response_code"):
+            query_builder = query_builder.eq("response_code", filters["response_code"])
+
+        response = query_builder.order("id", descending=True).execute()
+        data = response.data
+
+        # Post-filter languages dictionary structure since Supabase stores it as JSONB
+        if filters.get("language") and data:
+            target_lang = filters["language"].lower()
+            data = [
+                row for row in data 
+                if isinstance(row.get("languages"), dict) and target_lang in row["languages"]
+            ]
+
+        return data
+
+    # =========================================================================
+    # KEYWORDS TABLE MANAGEMENT
+    # =========================================================================
+
+    def insert_keywords(self, words: list, is_good: bool) -> dict:
+        """
+        Processes a list of words, detects their language, 
+        and inserts or ignores conflicts into the KEYWORDS table.
+        """
+        payloads = []
+        for word in words:
+            word_clean = word.strip()
+            if not word_clean:
+                continue
+                
+            # Basic Language Detection for each keyword token
+            try:
+                predictions = detect_langs(word_clean)
+                detected_langs = {p.lang: round(p.prob, 2) for p in predictions}
+            except Exception:
+                detected_langs = {"unknown": 1.0}
+
+            payloads.append({
+                "word": word_clean,
+                "good": is_good,
+                "language": detected_langs  # Saved natively as a structured JSON object
+            })
+
+        if not payloads:
+            return {"success": False, "message": "No valid keywords provided."}
+
+        try:
+            # Upsert on conflict 'word' constraint to handle unique strings gracefully
+            response = (
+                self.supabase.table("KEYWORDS")
+                .upsert(payloads, on_conflict="word")
+                .execute()
+            )
+            return {"success": True, "count": len(payloads)}
+        except Exception as e:
+            raise Exception(f"Database keyword insertion failed: {str(e)}")
+
+    def get_all_keywords(self) -> list:
+        """Fetches all keywords from the database sorted by generation date."""
+        response = (
+            self.supabase.table("KEYWORDS")
+            .select("*")
+            .order("id", descending=True)
+            .execute()
+        )
+        return response.data
+
+    def delete_keyword(self, keyword_id: int):
+        """Removes a keyword signature index from the KEYWORDS table by its unique ID."""
+        return (
+            self.supabase.table("KEYWORDS")
+            .delete()
+            .eq("id", keyword_id)
+            .execute()
+        )
