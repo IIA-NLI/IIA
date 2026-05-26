@@ -29,8 +29,8 @@ class ArchiveBackend:
                 url, headers=headers, timeout=10.0, follow_redirects=True
             )
             response_code = response.status_code
-            status = "success" if response_code == 200 else "error"
-            status_details = f"Fetched successfully with HTTP {response_code}"
+            status = "Approved" if response_code == 200 else "Not sure"
+            status_details = "Manually added"
         except Exception as e:
             return {
                 "url": url,
@@ -39,8 +39,8 @@ class ArchiveBackend:
                 "title_english": None,
                 "description_english": None,
                 "languages": {"error": "Failed to resolve domain"},
-                "status": "failed",
-                "status_details": str(e),
+                "status": "Not relevant",
+                "status_details": f"Failed to resolve domain: {str(e)}",
                 "source": "manually",
                 "response_code": None,
             }
