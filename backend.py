@@ -6,6 +6,12 @@ from deep_translator import GoogleTranslator
 from langdetect import detect_langs
 from supabase import create_client, Client
 import streamlit as st
+from urllib.parse import urlparse
+
+try:
+    from googleapiclient.discovery import build
+except Exception:
+    build = None
 
 
 class ArchiveBackend:
@@ -103,6 +109,96 @@ class ArchiveBackend:
             "source": "manually",
             "response_code": response_code,
         }
+
+    def google_search(self, query: str, num_results: int = 100, language: str = "en") -> list:
+        """Fetch up to `num_results` results from Google CSE.
+
+        Returns a list of URL strings. Requires `cse_key` and `cse_id` in Streamlit secrets.
+        """
+        api_key = st.secrets.get("cse_key")
+        cse_id = st.secrets.get("cse_id")
+
+        lang_for_hl = (language or "en")
+        lang_for_lr = (language.split("-")[0].lower() if language else "en")
+        lr_param = f"lang_{lang_for_lr}" if len(lang_for_lr) == 2 else None
+
+        if build is None:
+            raise RuntimeError("googleapiclient.discovery.build is not available in the environment")
+
+        service = build("customsearch", "v1", developerKey=api_key)
+
+        target = min(int(num_results), 100)
+        all_results = []
+        start_index = 1
+
+        while len(all_results) < target and start_index <= 91:
+            page_num = min(10, target - len(all_results))
+
+            req = {
+                "q": query,
+                "cx": cse_id,
+                "num": page_num,
+                "start": start_index,
+                "hl": lang_for_hl,
+            }
+            if lr_param:
+                req["lr"] = lr_param
+
+            results = service.cse().list(**req).execute()
+            items = results.get("items", [])
+            if not items:
+                break
+
+            for item in items:
+                link = item.get("link")
+                if link:
+                    all_results.append(link)
+                    if len(all_results) >= target:
+                        break
+
+            start_index += 10
+
+            total_avail_str = results.get("searchInformation", {}).get("totalResults", "0")
+            try:
+                total_avail = int(total_avail_str)
+                if start_index > total_avail:
+                    break
+            except ValueError:
+                pass
+
+        return all_results
+
+    def evaluate_payload(self, payload: dict, good_keywords: list | None = None) -> dict:
+        """Apply auto-evaluation rules to a scraped payload and set status/status_details.
+
+        Rules implemented:
+        - Hostname endswith `.il` => Approved
+        - Detected languages include Hebrew (`he`) => Approved
+        - Any `good_keywords` found in title/description (orig or english) => Approved
+        Otherwise status is `Not sure`.
+        """
+        approved = False
+
+        url = payload.get("url") or ""
+        parsed = urlparse(url)
+        hostname = (parsed.hostname or "").lower()
+        if hostname.endswith(".il"):
+            approved = True
+
+        languages = payload.get("languages") or {}
+        if any(str(l).lower().startswith("he") for l in languages.keys()):
+            approved = True
+
+        if good_keywords:
+            text_fields = " ".join([str(payload.get(k) or "") for k in ("title", "description", "title_english", "description_english")]).lower()
+            for kw in good_keywords:
+                if kw.lower() in text_fields:
+                    approved = True
+                    break
+
+        payload["status"] = "Approved" if approved else "Not sure"
+        payload["status_details"] = "Auto-evaluated"
+        return payload
 
     def insert_domain(self, payload: dict):
         """Upserts processed metadata into the DOMAINS table."""

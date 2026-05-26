@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 from backend import ArchiveBackend
+from urllib.parse import urlparse
 
 # --- PAGE SETUP ---
 st.set_page_config(
@@ -14,6 +15,11 @@ st.set_page_config(
 def get_backend():
     return ArchiveBackend()
 
+# Ensure cached instance is cleared so changes to ArchiveBackend are picked up
+try:
+    get_backend.clear()
+except Exception:
+    pass
 
 backend = get_backend()
 
@@ -193,28 +199,156 @@ if check_password():
 
     # --- VIEW 3: LEGACY REGULAR SEARCH BACKWARD-COMPATIBILITY ---
     elif option == "🌐 Add URLs using Search":
-        st.header("🔍 Quick Query Search Engine")
-        search_query = st.text_input("Search across rows instantly:", placeholder="e.g., archive")
-        if search_query:
-            with st.spinner("Searching records..."):
+        st.header("🔍 Google Keyword Search & Ingest Tool")
+
+        # google_search is provided by backend.google_search()
+
+        # UI for keyword-driven Google search
+        st.write("This tool searches Google for keywords and offers an approval workflow for results.")
+
+        language_options = {
+            "English (en)": "en",
+            "Hebrew (he)": "he",
+            "Arabic (ar)": "ar",
+            "French (fr)": "fr",
+            "German (de)": "de",
+            "Italian (it)": "it",
+            "Russian (ru)": "ru",
+            "Yiddish (yi)": "yi",
+            "Dutch (nl)": "nl",
+            "Romanian (ro)": "ro",
+            "Hungarian (hu)": "hu",
+            "Spanish - Latin America (es-419)": "es-419",
+            "Spanish - Spain (es-ES)": "es-ES",
+            "Portuguese - Brazil (pt-BR)": "pt-BR",
+            "Portuguese - Portugal (pt-PT)": "pt-PT",
+            "Turkish": "tr",
+            "Polish (pl)": "pl"
+        }
+
+        with st.form("keywords_search_form"):
+            keywords_query = st.text_area("Keywords List:", help="Enter the keywords you want to search for. Use commas to separate multiple keywords.")
+
+            col1, col2 = st.columns(2)
+            with col1:
+                selected_language = st.selectbox("Language:", options=list(language_options.keys()))
+                language = language_options[selected_language]
+            with col2:
+                limit = st.selectbox("Max Results:", options=[100, 50, 10], index=0)
+
+            col3, col4 = st.columns(2)
+            with col3:
+                include_inurl = st.checkbox("Include 'inurl' in the search", value=False)
+            with col4:
+                homepage_only = st.checkbox("Include only homepage results", value=False)
+
+            run_search = st.form_submit_button("Run Keyword Search")
+
+        if run_search:
+            if not keywords_query.strip():
+                st.warning("Please provide keywords to search for.")
+            else:
+                keywords = [k.strip() for k in keywords_query.split(",") if k.strip()]
+                all_links = []
+                for kw in keywords:
+                    q = kw
+                    if include_inurl:
+                        q = f"inurl:{kw}"
+                    try:
+                        links = backend.google_search(q, num_results=limit, language=language)
+                    except Exception as e:
+                        st.error(f"Search failed: {e}")
+                        links = []
+                    all_links.extend(links)
+
+                # Deduplicate and normalize
+                unique_links = list(dict.fromkeys(all_links))
+                st.success(f"Collected {len(unique_links)} unique URLs from search results.")
+
+                # Load good keywords for 'good keyword' rule
                 try:
-                    records = backend.search_domains(search_query)
-                    if records:
-                        st.write(f"Found **{len(records)}** records.")
-                        for row in records:
-                            h = row["title"] or row["title_english"] or "No Title"
-                            with st.expander(f"🌐 {row['url']} — {h}"):
-                                c1, c2 = st.columns(2)
-                                with c1:
-                                    st.write(f"**Title:** {row['title']}")
-                                    st.write(f"**Description:** {row['description']}")
-                                with c2:
-                                    st.write(f"**English Title:** {row['title_english']}")
-                                    st.write(f"**Languages Map:** `{row['languages']}`")
-                    else:
-                        st.info("No matching records found.")
-                except Exception as search_err:
-                    st.error(f"Search query execution failed: {search_err}")
+                    kw_rows = backend.get_all_keywords() or []
+                    good_kw_list = [r["word"] for r in kw_rows if r.get("good")]
+                except Exception:
+                    good_kw_list = []
+
+                processed = []
+                for link in unique_links:
+                    if homepage_only:
+                        p = urlparse(link)
+                        path = p.path.rstrip("/")
+                        if path and path != "":
+                            continue
+
+                    payload = backend.analyze_and_extract_url(link)
+
+                    # Determine approval rules
+                    approved = False
+                    parsed = urlparse(payload.get("url") or link)
+                    hostname = parsed.hostname or ""
+                    if hostname.lower().endswith(".il"):
+                        approved = True
+
+                    languages = payload.get("languages") or {}
+                    if any(l.lower().startswith("he") for l in languages.keys()):
+                        approved = True
+
+                    # Check for any good keyword present in title/description (original or english)
+                    text_fields = " ".join([str(payload.get(k) or "") for k in ("title", "description", "title_english", "description_english")]).lower()
+                    for gkw in good_kw_list:
+                        if gkw.lower() in text_fields:
+                            approved = True
+                            break
+
+                    payload["status"] = "Approved" if approved else "Not sure"
+                    payload["status_details"] = "Auto-evaluated via keyword search"
+                    processed.append(payload)
+
+                # Show processed list and allow user to approve unknowns
+                unknowns = [p for p in processed if p.get("status") != "Approved"]
+
+                st.write("---")
+                st.subheader("Processed Results")
+                st.write(f"Auto-approved: {len(processed) - len(unknowns)} | Unknowns requiring review: {len(unknowns)}")
+
+                # Display approved ones first
+                for p in processed:
+                    if p.get("status") == "Approved":
+                        with st.expander(f"✅ {p['url']} — {p.get('title') or p.get('title_english') or 'No Title'}"):
+                            st.write(p)
+
+                if unknowns:
+                    st.subheader("Review Unknown Results")
+                    approvals = {}
+                    with st.form("unknowns_review_form"):
+                        for i, p in enumerate(unknowns):
+                            colA, colB = st.columns([6,1])
+                            with colA:
+                                st.markdown(f"**{p['url']}** — {p.get('title') or p.get('title_english') or 'No Title'}")
+                                st.write(p.get('description') or '')
+                                st.caption(f"Detected languages: {p.get('languages')}")
+                            with colB:
+                                approvals[i] = st.checkbox("Approve", key=f"approve_{i}")
+
+                        commit_choices = st.form_submit_button("Commit Selected to Archive")
+
+                    if commit_choices:
+                        to_commit = []
+                        for idx, approved_flag in approvals.items():
+                            if approved_flag:
+                                item = unknowns[idx]
+                                item['status'] = 'Approved'
+                                to_commit.append(item)
+
+                        if to_commit:
+                            for item in to_commit:
+                                try:
+                                    backend.insert_domain(item)
+                                except Exception as e:
+                                    st.error(f"Failed to save {item['url']}: {e}")
+                            st.success(f"Saved {len(to_commit)} selected records to the archive.")
+                        else:
+                            st.info("No selections made to commit.")
 
     # --- VIEW 4A: ADD/MANAGE KEYWORDS ---
     elif option == "🏷️ Add Keywords":
