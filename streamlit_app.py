@@ -71,22 +71,97 @@ if check_password():
 
         with st.form("url_fetch_form"):
             input_url = st.text_input("Target URL", placeholder="example.co.il")
-            fetch_btn = st.form_submit_button("Analyze Remote Server")
+            fetch_btn = st.form_submit_button("Analyze Domain")
 
         if fetch_btn:
             if not input_url:
                 st.warning("Please specify a valid URL path first.")
             else:
-                with st.spinner("Analyzing and parsing remote server contents..."):
-                    scraped_payload = backend.analyze_and_extract_url(input_url)
-                    st.session_state["current_payload"] = scraped_payload
-                    st.session_state["show_editor"] = True
+                normalized_url, domain_key, has_extra_path, trimmed_url = backend.normalize_manual_url(input_url)
+
+                if has_extra_path:
+                    st.session_state["manual_original_url"] = normalized_url
+                    st.session_state["manual_trimmed_url"] = trimmed_url
+                    st.session_state["manual_pending_domain"] = domain_key
+                    st.session_state["manual_url_needs_choice"] = True
+                    st.session_state["manual_domain_exists"] = False
+                    st.session_state["show_editor"] = False
+                else:
+                    st.session_state["manual_url_needs_choice"] = False
+                    st.session_state["manual_pending_url"] = normalized_url
+                    st.session_state["manual_pending_domain"] = domain_key
+                    if backend.domain_exists(domain_key):
+                        st.session_state["manual_domain_exists"] = True
+                        st.session_state["show_editor"] = False
+                    else:
+                        with st.spinner("Analyzing and parsing remote server contents..."):
+                            scraped_payload = backend.analyze_and_extract_url(normalized_url)
+                            st.session_state["current_payload"] = scraped_payload
+                            st.session_state["show_editor"] = True
+                            st.session_state["manual_domain_exists"] = False
+
+        if st.session_state.get("manual_url_needs_choice"):
+            st.warning(
+                "The URL you entered includes a path/query/fragment and is not a bare domain or subdomain."
+            )
+            st.info("Choose whether to analyze the full URL or trim it to the domain root before continuing.")
+            with st.form("manual_url_choice_form"):
+                url_choice = st.radio(
+                    "Select the preferred URL to analyze:",
+                    ["Continue with full URL", "Trim to domain root"],
+                    index=1,
+                )
+                choice_btn = st.form_submit_button("Continue")
+
+            if choice_btn:
+                analysis_url = (
+                    st.session_state["manual_original_url"]
+                    if url_choice == "Continue with full URL"
+                    else st.session_state["manual_trimmed_url"]
+                )
+                st.session_state["manual_pending_url"] = analysis_url
+                st.session_state["manual_pending_domain"] = st.session_state["manual_pending_domain"]
+                st.session_state["manual_url_needs_choice"] = False
+
+                if backend.domain_exists(st.session_state["manual_pending_domain"]):
+                    st.session_state["manual_domain_exists"] = True
+                    st.session_state["show_editor"] = False
+                else:
+                    with st.spinner("Analyzing and parsing remote server contents..."):
+                        scraped_payload = backend.analyze_and_extract_url(analysis_url)
+                        st.session_state["current_payload"] = scraped_payload
+                        st.session_state["show_editor"] = True
+                        st.session_state["manual_domain_exists"] = False
+
+        if st.session_state.get("manual_domain_exists"):
+            st.warning(f"The domain `{st.session_state.get('manual_pending_domain')}` already exists in the database.")
+            with st.form("existing_domain_choice_form"):
+                existing_choice = st.radio(
+                    "Do you want to reanalyze it or skip?",
+                    ["Reanalyze and update", "Skip"],
+                    index=0,
+                )
+                existing_choice_btn = st.form_submit_button("Continue")
+
+            if existing_choice_btn:
+                if existing_choice == "Reanalyze and update":
+                    with st.spinner("Reanalyzing existing domain..."):
+                        scraped_payload = backend.analyze_and_extract_url(st.session_state.get("manual_pending_url"))
+                        st.session_state["current_payload"] = scraped_payload
+                        st.session_state["show_editor"] = True
+                else:
+                    st.info("Skipped analysis for the existing domain.")
+                    st.session_state["show_editor"] = False
+
+                st.session_state["manual_domain_exists"] = False
 
         if st.session_state.get("show_editor"):
             payload = st.session_state["current_payload"]
+            chosen_url = st.session_state.get("manual_pending_url", payload.get("url"))
 
             st.write("---")
             st.subheader("🔍 Review and Edit Extracted Metadata")
+            st.markdown(f"**Chosen URL:** `{chosen_url}`")
 
             with st.form("metadata_edit_form"):
                 col1, col2 = st.columns(2)
@@ -183,19 +258,73 @@ if check_password():
 
             if results is not None:
                 st.write(f"Query returned **{len(results)}** matching index records.")
-                for row in results:
+                for idx, row in enumerate(results):
                     header_title = row.get("title") or row.get("title_english") or "No Title Available"
+                    edit_key = f"edit_record_{idx}"
                     with st.expander(f"🌐 {row['url']} — {header_title}"):
-                        col1, col2 = st.columns(2)
+                        col1, col2 = st.columns([3, 1])
                         with col1:
                             st.write(f"**Original Title:** {row.get('title')}")
                             st.write(f"**Original Description:** {row.get('description')}")
                             st.write(f"**Response Code:** `{row.get('response_code')}` | **Status:** `{row.get('status')}`")
                         with col2:
+                            # Use a distinct widget key for the button so it doesn't
+                            # conflict with the session flag used to track edit state.
+                            st.button(
+                                "Edit",
+                                key=f"{edit_key}_btn",
+                                on_click=lambda k=edit_key: st.session_state.__setitem__(k, True),
+                            )
+                        col3, col4 = st.columns(2)
+                        with col3:
                             st.write(f"**English Title:** {row.get('title_english')}")
                             st.write(f"**English Description:** {row.get('description_english')}")
+                        with col4:
                             st.write(f"**Languages Map:** `{row.get('languages')}`")
                         st.caption(f"Source: `{row.get('source')}` | Updated: {row.get('updated_at')}")
+
+                        if st.session_state.get(edit_key, False):
+                            with st.form(f"edit_row_form_{idx}"):
+                                st.markdown("### Edit this record")
+                                edited_status = st.selectbox(
+                                    "Status:",
+                                    options=["Approved", "Not sure", "Not relevant"],
+                                    index=["Approved", "Not sure", "Not relevant"].index(row.get("status") if row.get("status") in ["Approved", "Not sure", "Not relevant"] else "Not sure"),
+                                )
+                                edited_details = st.text_input("Status Details:", value=row.get("status_details") or "")
+                                edited_title = st.text_input("Original Title:", value=row.get("title") or "")
+                                edited_description = st.text_area("Original Description:", value=row.get("description") or "")
+                                edited_title_en = st.text_input("English Title:", value=row.get("title_english") or "")
+                                edited_description_en = st.text_area("English Description:", value=row.get("description_english") or "")
+                                langs_value = row.get("languages")
+                                langs_csv = ", ".join(langs_value.keys()) if isinstance(langs_value, dict) else str(langs_value)
+                                edited_langs = st.text_input("Languages (comma-separated):", value=langs_csv)
+
+                                save_btn = st.form_submit_button("Save changes")
+                                cancel_btn = st.form_submit_button(
+                                    "Cancel",
+                                    on_click=lambda k=edit_key: st.session_state.__setitem__(k, False),
+                                )
+
+                                if save_btn:
+                                    updated_row = row.copy()
+                                    updated_row["status"] = edited_status
+                                    updated_row["status_details"] = edited_details or updated_row.get("status_details")
+                                    updated_row["title"] = edited_title or None
+                                    updated_row["description"] = edited_description or None
+                                    updated_row["title_english"] = edited_title_en or None
+                                    updated_row["description_english"] = edited_description_en or None
+                                    cleaned_langs = [l.strip() for l in edited_langs.split(",") if l.strip()]
+                                    if cleaned_langs:
+                                        updated_row["languages"] = {lang: 1.0 for lang in cleaned_langs}
+                                    try:
+                                        backend.insert_domain(updated_row)
+                                        st.success(f"Saved updates for {row.get('url')}")
+                                        st.session_state[edit_key] = False
+                                    except Exception as e:
+                                        st.error(f"Failed to save record: {e}")
+                                elif cancel_btn:
+                                    st.session_state[edit_key] = False
 
     # --- VIEW 3: LEGACY REGULAR SEARCH BACKWARD-COMPATIBILITY ---
     elif option == "🌐 Add URLs using Search":
@@ -357,65 +486,89 @@ if check_password():
                         payload["status_details"] = "Auto-evaluated via keyword search"
                     processed.append(payload)
 
-                # Show processed list and allow user to approve unknowns
-                unknowns = [p for p in processed if p.get("status") != "Approved"]
-
+                # Show processed list and allow user to edit properties for ALL results
                 st.write("---")
+                status_options = ["Approved", "Not sure", "Not relevant"]
+
+                approved_count = len([p for p in processed if p.get("status") == "Approved"])
+                unknown_count = len([p for p in processed if p.get("status") != "Approved"])
                 st.subheader("Processed Results")
-                st.write(f"Auto-approved: {len(processed) - len(unknowns)} | Unknowns requiring review: {len(unknowns)}")
+                st.write(f"Auto-approved: {approved_count} | Unknowns requiring review: {unknown_count}")
 
-                # Display approved ones first
-                for p in processed:
-                    if p.get("status") == "Approved":
-                        with st.expander(f"✅ {p['url']} — {p.get('title') or p.get('title_english') or 'No Title'}"):
-                            st.write(p)
+                # Unified editable form for all processed results (auto-approved included)
+                # reorder so non-approved (unknowns) come first, approved items at the end
+                ordered_processed = [p for p in processed if p.get("status") != "Approved"] + [p for p in processed if p.get("status") == "Approved"]
 
-                if unknowns:
-                    st.subheader("Review Unknown Results")
-                    status_options = ["Approved", "Not sure", "Not relevant"]
-                    with st.form("unknowns_review_form"):
-                        commit_map = {}
-                        for i, p in enumerate(unknowns):
-                            with st.expander(f"{p['url']} — {p.get('title') or p.get('title_english') or 'No Title'}", expanded=False):
-                                st.markdown(f"**Original Title:** {p.get('title')}")
-                                st.markdown(f"**English Title:** {p.get('title_english')}")
-                                st.markdown(f"**Original Description:** {p.get('description')}")
-                                st.markdown(f"**English Description:** {p.get('description_english')}")
-                                st.write(f"**Response Code:** `{p.get('response_code')}`")
-                                st.write(f"**Detected languages:** `{p.get('languages')}`")
-                                st.write(f"**Source:** {p.get('source')}")
+                with st.form("processed_review_form"):
+                    for i, p in enumerate(ordered_processed):
+                        prefix = "✅ " if p.get("status") == "Approved" else ""
+                        with st.expander(f"{prefix}{p['url']} — {p.get('title') or p.get('title_english') or 'No Title'}", expanded=(p.get("status") != "Approved")):
+                            st.markdown(f"**Source:** {p.get('source')}")
+                            st.write(f"**Response Code:** `{p.get('response_code')}`")
+                            st.markdown(f"**Original Title:** {p.get('title')}")
+                            st.markdown(f"**English Title:** {p.get('title_english')}")
+                            st.markdown(f"**Original Description:** {p.get('description')}")
+                            st.markdown(f"**English Description:** {p.get('description_english')}")
 
-                                selected_status = st.selectbox("Select Status:", options=status_options, index=status_options.index(p.get('status')) if p.get('status') in status_options else 1, key=f"status_{i}")
-                                status_details = st.text_input("Status Details:", value=p.get('status_details') or "", key=f"details_{i}")
-                                include = st.checkbox("Include in commit", key=f"commit_{i}")
-                                commit_map[i] = {"include": include, "status": selected_status, "details": status_details}
+                            default_idx = status_options.index(p.get('status')) if p.get('status') in status_options else 1
+                            selected_status = st.selectbox(
+                                "Select Status:",
+                                options=status_options,
+                                index=default_idx,
+                                key=f"status_{i}",
+                            )
+                            # Mirror widget values into session_state explicitly so they
+                            # are available when the form is submitted (robust across reruns).
+                            st.session_state[f"status_{i}"] = selected_status
 
-                        commit_choices = st.form_submit_button("Commit Selected to Archive")
+                            status_details = st.text_input(
+                                "Status Details:", value=p.get('status_details') or "", key=f"details_{i}"
+                            )
+                            st.session_state[f"details_{i}"] = status_details
 
-                    if commit_choices:
-                        to_commit = []
-                        for idx, meta in commit_map.items():
-                            if meta.get("include"):
-                                item = unknowns[idx]
-                                item['status'] = meta.get('status')
-                                if item['status'] == 'Approved':
-                                    item['status_details'] = 'Approved by user'
-                                else:
-                                    item['status_details'] = meta.get('details') or item.get('status_details')
-                                to_commit.append(item)
+                            # Allow editing detected languages for auto-approved and unknowns
+                            langs_csv = ", ".join(list((p.get('languages') or {}).keys()))
+                            edited_langs = st.text_input(
+                                "Languages (comma-separated):", value=langs_csv, key=f"langs_{i}"
+                            )
+                            st.session_state[f"langs_{i}"] = edited_langs
 
-                        if to_commit:
-                            saved = 0
-                            for item in to_commit:
-                                try:
-                                    backend.insert_domain(item)
-                                    saved += 1
-                                except Exception as e:
-                                    st.error(f"Failed to save {item['url']}: {e}")
-                            if saved:
-                                st.success(f"Saved {saved} selected records to the archive.")
+                    # give the submit button an explicit key to avoid collisions
+                    commit_all = st.form_submit_button("Commit All to Archive", key="commit_all_btn")
+
+                if commit_all:
+                    to_commit = []
+                    for i, p in enumerate(ordered_processed):
+                        # read back edited values from session_state
+                        status = st.session_state.get(f"status_{i}", p.get('status'))
+                        details = st.session_state.get(f"details_{i}", p.get('status_details'))
+                        langs_str = st.session_state.get(f"langs_{i}", ", ".join(list((p.get('languages') or {}).keys())))
+
+                        cleaned_langs = [l.strip() for l in langs_str.split(",") if l.strip()]
+
+                        p['status'] = status
+                        if p['status'] == 'Approved':
+                            p['status_details'] = details or 'Determined by user'
                         else:
-                            st.info("No selections made to commit.")
+                            p['status_details'] = details or p.get('status_details')
+
+                        if cleaned_langs:
+                            p['languages'] = {lang: 1.0 for lang in cleaned_langs}
+
+                        to_commit.append(p)
+
+                    if to_commit:
+                        saved = 0
+                        for item in to_commit:
+                            try:
+                                backend.insert_domain(item)
+                                saved += 1
+                            except Exception as e:
+                                st.error(f"Failed to save {item['url']}: {e}")
+                        if saved:
+                            st.success(f"Saved {saved} records to the archive.")
+                    else:
+                        st.info("No records to commit.")
 
     # --- VIEW 4A: ADD/MANAGE KEYWORDS ---
     elif option == "🏷️ Add Keywords":
