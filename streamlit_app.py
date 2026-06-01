@@ -54,7 +54,6 @@ if check_password():
     # =========================================================================
     st.sidebar.title("🗂️ Navigation Control")
     
-    # Combined functional routing map into a single organized radio menu with groupings
     option = st.sidebar.radio(
         "Choose App Tool Engine:",
         [
@@ -75,8 +74,11 @@ if check_password():
             fetch_btn = st.form_submit_button("Analyze Domain")
 
         if fetch_btn:
+            # Explicit input verification: Check format, whitespace, or illegal chars
             if not input_url:
                 st.warning("Please specify a valid URL path first.")
+            elif not backend.is_valid_url_format(input_url):
+                st.error("❌ Invalid URL structure! Spaces or special characters are forbidden.")
             else:
                 normalized_url, domain_key, has_extra_path, trimmed_url = backend.normalize_manual_url(input_url)
 
@@ -121,7 +123,6 @@ if check_password():
                     else st.session_state["manual_trimmed_url"]
                 )
                 st.session_state["manual_pending_url"] = analysis_url
-                st.session_state["manual_pending_domain"] = st.session_state["manual_pending_domain"]
                 st.session_state["manual_url_needs_choice"] = False
 
                 if backend.domain_exists(st.session_state["manual_pending_domain"]):
@@ -175,25 +176,32 @@ if check_password():
                     edited_status = st.selectbox("Status Evaluation", options=status_options, index=default_status_idx)
                     edited_status_details = st.text_input("Status Details", value="Manually added")
 
-                    st.text_input("Extracted Title", value=payload["title"], disabled=True)
-                    st.text_area("Extracted Description", value=payload["description"], disabled=True)
+                    st.text_input("Extracted Title", value=payload["title"] or "", disabled=True)
+                    st.text_area("Extracted Description", value=payload["description"] or "", disabled=True)
 
                 with col2:
-                    detected_langs_list = list(payload["languages"].keys())
+                    detected_langs_list = (
+                        list(payload["languages"].keys())
+                        if isinstance(payload.get("languages"), dict)
+                        else []
+                    )
                     edited_langs_str = st.text_input("Languages List (comma-separated)", value=", ".join(detected_langs_list))
 
-                    st.text_input("English Title Translation", value=payload["title_english"], disabled=True)
-                    st.text_area("English Description Translation", value=payload["description_english"], disabled=True)
+                    st.text_input("English Title Translation", value=payload["title_english"] or "", disabled=True)
+                    st.text_area("English Description Translation", value=payload["description_english"] or "", disabled=True)
 
                 submit_to_db = st.form_submit_button("Save and Commit to Archive")
 
                 if submit_to_db:
                     cleaned_langs = [l.strip() for l in edited_langs_str.split(",") if l.strip()]
-                    updated_langs_dict = {lang: 1.0 for lang in cleaned_langs}
 
                     payload["status"] = edited_status
                     payload["status_details"] = edited_status_details
-                    payload["languages"] = updated_langs_dict
+                    payload["languages"] = (
+                        {lang: 1.0 for lang in cleaned_langs}
+                        if cleaned_langs
+                        else None
+                    )
 
                     try:
                         backend.insert_domain(payload)
@@ -269,8 +277,6 @@ if check_password():
                             st.write(f"**Original Description:** {row.get('description')}")
                             st.write(f"**Response Code:** `{row.get('response_code')}` | **Status:** `{row.get('status')}`")
                         with col2:
-                            # Use a distinct widget key for the button so it doesn't
-                            # conflict with the session flag used to track edit state.
                             st.button(
                                 "Edit",
                                 key=f"{edit_key}_btn",
@@ -322,36 +328,24 @@ if check_password():
                                         backend.insert_domain(updated_row)
                                         st.success(f"Saved updates for {row.get('url')}")
                                         st.session_state[edit_key] = False
+                                        st.rerun()
                                     except Exception as e:
                                         st.error(f"Failed to save record: {e}")
                                 elif cancel_btn:
                                     st.session_state[edit_key] = False
+                                    st.rerun()
 
-    # --- VIEW 3: LEGACY REGULAR SEARCH BACKWARD-COMPATIBILITY ---
+    # --- VIEW 3: GOOGLE KEYWORD SEARCH ---
     elif option == "🌐 Add URLs using Search":
         st.header("🔍 Google Keyword Search & Ingest Tool")
-
-        # google_search is provided by backend.google_search()
         st.write("This tool searches Google for keywords and offers an approval workflow for results.")
 
         language_options = {
-            "English (en)": "en",
-            "Hebrew (he)": "he",
-            "Arabic (ar)": "ar",
-            "French (fr)": "fr",
-            "German (de)": "de",
-            "Italian (it)": "it",
-            "Russian (ru)": "ru",
-            "Yiddish (yi)": "yi",
-            "Dutch (nl)": "nl",
-            "Romanian (ro)": "ro",
-            "Hungarian (hu)": "hu",
-            "Spanish - Latin America (es-419)": "es-419",
-            "Spanish - Spain (es-ES)": "es-ES",
-            "Portuguese - Brazil (pt-BR)": "pt-BR",
-            "Portuguese - Portugal (pt-PT)": "pt-PT",
-            "Turkish": "tr",
-            "Polish (pl)": "pl",
+            "English (en)": "en", "Hebrew (he)": "he", "Arabic (ar)": "ar", "French (fr)": "fr",
+            "German (de)": "de", "Italian (it)": "it", "Russian (ru)": "ru", "Yiddish (yi)": "yi",
+            "Dutch (nl)": "nl", "Romanian (ro)": "ro", "Hungarian (hu)": "hu", "Spanish - Latin America (es-419)": "es-419",
+            "Spanish - Spain (es-ES)": "es-ES", "Portuguese - Brazil (pt-BR)": "pt-BR", "Portuguese - Portugal (pt-PT)": "pt-PT",
+            "Turkish": "tr", "Polish (pl)": "pl",
         }
 
         def clear_processed_review_state():
@@ -393,9 +387,10 @@ if check_password():
                 st.warning("Please provide keywords to search for.")
             else:
                 keywords = [k.strip() for k in keywords_query.split(",") if k.strip()]
-                all_links = []  # list of (link, keyword) tuples
+                all_links = []  
 
                 for kw in keywords:
+                    # 'inurl' option implementation
                     q = f"inurl:{kw}" if include_inurl else kw
                     try:
                         links = backend.google_search(q, num_results=limit, language=language)
@@ -404,8 +399,6 @@ if check_password():
                         links = []
                     all_links.extend([(l, kw) for l in links])
 
-                # Normalize to domain roots (scheme://netloc), deduplicate by domain,
-                # remember which keyword produced each domain, and skip existing DB domains.
                 domain_to_keyword = {}
                 root_urls = []
                 seen = set()
@@ -425,16 +418,16 @@ if check_password():
                     domain_key = netloc[4:] if netloc.startswith("www.") else netloc
                     domain_root = f"{p.scheme}://{p.netloc}"
 
-                    # If homepage_only requested, only include original links that were root/homepages.
+                    # 'homepage_only' filtering implementation
                     if homepage_only:
-                        path = p.path.rstrip("/")
-                        if path:
+                        path_clean = p.path.strip("/")
+                        # If a path query or fragment parameters exist, reject this non-homepage branch result
+                        if path_clean or p.query or p.fragment:
                             continue
 
                     if domain_key in seen:
                         continue
 
-                    # Skip if domain already exists in DB (check normalized domain_key).
                     try:
                         if backend.domain_exists(domain_key):
                             continue
@@ -448,7 +441,6 @@ if check_password():
                 unique_links = root_urls
                 st.success(f"Collected {len(unique_links)} unique domain roots from search results.")
 
-                # Load good keywords for the auto-evaluation rule.
                 try:
                     kw_rows = backend.get_all_keywords() or []
                     good_kw_list = [r["word"] for r in kw_rows if r.get("good")]
@@ -469,7 +461,6 @@ if check_password():
                     if originating_kw:
                         payload["source"] = f"Google search for {originating_kw}"
 
-                    # Evaluate payload using backend rules (sets status and status_details).
                     try:
                         payload = backend.evaluate_payload(payload, good_keywords=good_kw_list)
                     except Exception:
@@ -484,17 +475,7 @@ if check_password():
                         if any("hebrew" in str(l).lower() or str(l).lower().startswith("he") for l in languages.keys()):
                             approved = True
 
-                        text_fields = " ".join(
-                            [
-                                str(payload.get(k) or "")
-                                for k in (
-                                    "title",
-                                    "description",
-                                    "title_english",
-                                    "description_english",
-                                )
-                            ]
-                        ).lower()
+                        text_fields = " ".join([str(payload.get(k) or "") for k in ("title", "description", "title_english", "description_english")]).lower()
                         for gkw in good_kw_list:
                             if gkw.lower() in text_fields:
                                 approved = True
@@ -505,7 +486,6 @@ if check_password():
 
                     processed.append(payload)
 
-                # Store results in session_state so the review form survives Streamlit reruns.
                 st.session_state["ordered_processed"] = (
                     [p for p in processed if p.get("status") != "Approved"]
                     + [p for p in processed if p.get("status") == "Approved"]
@@ -529,10 +509,7 @@ if check_password():
                     title = p.get("title") or p.get("title_english") or "No Title"
                     url = p.get("url") or "Unknown URL"
 
-                    with st.expander(
-                        f"{prefix}{url} — {title}",
-                        expanded=(p.get("status") != "Approved"),
-                    ):
+                    with st.expander(f"{prefix}{url} — {title}", expanded=(p.get("status") != "Approved")):
                         st.markdown(f"**Source:** {p.get('source')}")
                         st.write(f"**Response Code:** `{p.get('response_code')}`")
                         st.markdown(f"**Original Title:** {p.get('title')}")
@@ -540,34 +517,12 @@ if check_password():
                         st.markdown(f"**Original Description:** {p.get('description')}")
                         st.markdown(f"**English Description:** {p.get('description_english')}")
 
-                        default_idx = (
-                            status_options.index(p.get("status"))
-                            if p.get("status") in status_options
-                            else 1
-                        )
+                        default_idx = status_options.index(p.get("status")) if p.get("status") in status_options else 1
 
-                        # Do NOT assign to st.session_state["status_i"] after this widget is created.
-                        # Streamlit owns widget-backed keys and raises StreamlitAPIException if
-                        # those keys are modified after widget instantiation in the same run.
-                        st.selectbox(
-                            "Select Status:",
-                            options=status_options,
-                            index=default_idx,
-                            key=f"status_{i}",
-                        )
-
-                        st.text_input(
-                            "Status Details:",
-                            value=p.get("status_details") or "",
-                            key=f"details_{i}",
-                        )
-
+                        st.selectbox("Select Status:", options=status_options, index=default_idx, key=f"status_{i}")
+                        st.text_input("Status Details:", value=p.get("status_details") or "", key=f"details_{i}")
                         langs_csv = ", ".join(list((p.get("languages") or {}).keys()))
-                        st.text_input(
-                            "Languages (comma-separated):",
-                            value=langs_csv,
-                            key=f"langs_{i}",
-                        )
+                        st.text_input("Languages (comma-separated):", value=langs_csv, key=f"langs_{i}")
 
                 commit_all = st.form_submit_button("Commit All to Archive", key="commit_all_btn")
 
@@ -578,13 +533,8 @@ if check_password():
                     updated_payload = p.copy()
 
                     status = st.session_state.get(f"status_{i}", updated_payload.get("status"))
-                    details = st.session_state.get(
-                        f"details_{i}", updated_payload.get("status_details")
-                    )
-                    langs_str = st.session_state.get(
-                        f"langs_{i}",
-                        ", ".join(list((updated_payload.get("languages") or {}).keys())),
-                    )
+                    details = st.session_state.get(f"details_{i}", updated_payload.get("status_details"))
+                    langs_str = st.session_state.get(f"langs_{i}", ", ".join(list((updated_payload.get("languages") or {}).keys())))
 
                     cleaned_langs = [l.strip() for l in langs_str.split(",") if l.strip()]
 
@@ -596,6 +546,8 @@ if check_password():
 
                     if cleaned_langs:
                         updated_payload["languages"] = {lang: 1.0 for lang in cleaned_langs}
+                    else:
+                        updated_payload["languages"] = None
 
                     to_commit.append(updated_payload)
 
@@ -611,7 +563,7 @@ if check_password():
                     if saved:
                         st.success(f"Saved {saved} records to the archive.")
                         with st.spinner("Refreshing..."):
-                            time.sleep(5)
+                            time.sleep(2)
                         clear_processed_review_state()
                         st.rerun()
                 else:
@@ -620,18 +572,11 @@ if check_password():
     # --- VIEW 4A: ADD/MANAGE KEYWORDS ---
     elif option == "🏷️ Add Keywords":
         st.header("🏷️ Add Keywords to Archive")
-
         st.subheader("1. Ingest Raw Keywords")
+        
         with st.form("kw_input_form"):
-            raw_input = st.text_area(
-                "Keywords (separated with commas)",
-                placeholder="e.g., חדשות, security, archive, ספורט",
-            )
-            keyword_type = st.radio(
-                "Classification Evaluation:",
-                ["Good Keyword (Whitelisted)", "Bad Keyword (Flagged)"],
-                horizontal=True
-            )
+            raw_input = st.text_area("Keywords (separated with commas)", placeholder="e.g., חדשות, security, archive, ספורט")
+            keyword_type = st.radio("Classification Evaluation:", ["Good Keyword (Whitelisted)", "Bad Keyword (Flagged)"], horizontal=True)
             analyze_kw_btn = st.form_submit_button("Analyze Keywords")
 
         if analyze_kw_btn:
@@ -646,21 +591,15 @@ if check_password():
         if st.session_state.get("show_kw_editor"):
             st.write("---")
             st.subheader("2. Review & Edit Detected Languages")
-            st.info("Modify languages below (comma-separated) before clicking save.")
 
             with st.form("kw_edit_form"):
                 final_payloads = []
-                
                 for idx, item in enumerate(st.session_state["analyzed_keywords_batch"]):
                     st.markdown(f"**Word:** `{item['word']}`")
-                    edited_lang_csv = st.text_input(
-                        f"Languages for '{item['word']}'", 
-                        value=", ".join(item["languages_list"]), 
-                        key=f"kw_lang_{idx}"
-                    )
+                    edited_lang_csv = st.text_input(f"Languages for '{item['word']}'", value=", ".join(item["languages_list"]), key=f"kw_lang_{idx}")
                     
                     cleaned_langs = [l.strip() for l in edited_lang_csv.split(",") if l.strip()]
-                    langs_dict = {lang: 1.0 for lang in cleaned_langs}
+                    langs_dict = {lang: 1.0 for lang in cleaned_langs} if cleaned_langs else None
                     
                     final_payloads.append({
                         "word": item["word"],
@@ -684,7 +623,6 @@ if check_password():
     # --- VIEW 4B: VIEW KEYWORDS DATABASE ---
     elif option == "🏷️ Keywords Database Explorer":
         st.header("🏷️ Keywords Database Browser")
-
         st.subheader("Current Database Entries Reference")
         view_mode = st.radio("Filter Database View by Type:", ["Show All", "🟢 Good Keywords Only", "🔴 Bad Keywords Only"], horizontal=True)
 
@@ -714,6 +652,5 @@ if check_password():
         except Exception as read_err:
             st.error(f"Failed to query active rows: {read_err}")
                 
-    # --- HANDLING SYSTEM SEPARATOR RELEASES ---
     else:
         st.info("Please pick a tool system module option from the sidebar manager to map live data components.")

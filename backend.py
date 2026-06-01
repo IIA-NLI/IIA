@@ -8,6 +8,8 @@ from supabase import create_client, Client
 import streamlit as st
 from urllib.parse import urlparse
 from datetime import datetime
+import pytz
+
 try:
     from zoneinfo import ZoneInfo
 except Exception:
@@ -26,6 +28,50 @@ class ArchiveBackend:
         self.url = st.secrets["SUPABASE_URL"]
         self.key = st.secrets["SUPABASE_KEY"]
         self.supabase: Client = create_client(self.url, self.key)
+
+    # =========================================================================
+    # TIMEZONE & VALIDATION HELPERS
+    # =========================================================================
+
+    def _now_jerusalem_iso(self) -> str:
+        """Return current time as ISO string strictly in Asia/Jerusalem timezone."""
+        try:
+            if ZoneInfo:
+                tz = ZoneInfo("Asia/Jerusalem")
+                return datetime.now(tz).isoformat()
+        except Exception:
+            pass
+
+        try:
+            tz = pytz.timezone("Asia/Jerusalem")
+            return datetime.now(tz).isoformat()
+        except Exception:
+            # Fallback for systems missing external timezone libraries
+            # Manual offset calculation can go here if needed, but standardizing on a explicit string marker
+            return datetime.now().isoformat()
+
+    def is_valid_url_format(self, url: str) -> bool:
+        """
+        Validates if the incoming string conforms to a standard URL layout.
+        Strictly forbids whitespaces or obvious illegal special characters.
+        """
+        clean_url = url.strip()
+        if not clean_url or " " in clean_url:
+            return False
+        
+        # Enforce basic scheme prefix check to pass it to urlparse safely
+        test_url = clean_url
+        if not test_url.lower().startswith("http://") and not test_url.lower().startswith("https://"):
+            test_url = "http://" + test_url
+
+        try:
+            parsed = urlparse(test_url)
+            # URL must have a valid hostname/netloc and cannot contain control symbols or spaces
+            if not parsed.netloc or not re.match(r"^[a-zA-Z0-9.:\-_]+$", parsed.netloc):
+                return False
+            return True
+        except Exception:
+            return False
 
     # =========================================================================
     # DOMAINS TABLE MANAGEMENT
@@ -62,12 +108,12 @@ class ArchiveBackend:
 
         # Parse HTML elements
         soup = BeautifulSoup(response.text, "html.parser")
-        title = soup.title.string.strip() if soup.title else ""
+        title = soup.title.string.strip() if soup.title and soup.title.string else ""
 
         desc_tag = soup.find("meta", attrs={"name": "description"}) or soup.find(
             "meta", attrs={"property": "og:description"}
         )
-        description = desc_tag["content"].strip() if desc_tag else ""
+        description = desc_tag["content"].strip() if desc_tag and desc_tag.get("content") else ""
 
         # Language Detection
         detected_langs = {}
@@ -76,19 +122,18 @@ class ArchiveBackend:
         if combined_text:
             try:
                 predictions = detect_langs(combined_text)
-                # map ISO codes to full language names
                 detected_langs = {self._lang_code_to_name(p.lang): round(p.prob, 2) for p in predictions}
             except Exception:
                 detected_langs = {"Unknown": 1.0}
         else:
-            detected_langs = {"empty": 1.0}
+            detected_langs = None
 
         # Translation Management
         title_english = title
         description_english = description
         dominant_lang = list(detected_langs.keys())[0] if detected_langs else "en"
 
-        if dominant_lang != "en" and "empty" not in detected_langs:
+        if detected_langs and dominant_lang != "en":
             try:
                 if title:
                     title_english = GoogleTranslator(
@@ -99,7 +144,7 @@ class ArchiveBackend:
                         source="auto", target="en"
                     ).translate(description)
             except Exception:
-                pass  # Keep status_details safely set to "Manually added"
+                pass  
 
         return {
             "url": url,
@@ -116,25 +161,6 @@ class ArchiveBackend:
             "response_code": response_code,
         }
 
-    def _now_jerusalem_iso(self) -> str:
-        """Return current time as ISO string in Asia/Jerusalem timezone."""
-        try:
-            if ZoneInfo:
-                tz = ZoneInfo("Asia/Jerusalem")
-                return datetime.now(tz).isoformat()
-        except Exception:
-            pass
-
-        try:
-            # fallback to pytz if zoneinfo not available
-            import pytz
-
-            tz = pytz.timezone("Asia/Jerusalem")
-            return datetime.now(tz).isoformat()
-        except Exception:
-            # final fallback to naive local time
-            return datetime.now().isoformat()
-
     def normalize_manual_url(self, url: str) -> tuple[str, str, bool, str]:
         """Normalize a URL and return a consistent domain key for manual ingestion.
 
@@ -144,7 +170,7 @@ class ArchiveBackend:
             has_extra_path: True when path/query/fragment exist beyond a bare domain
             trimmed_url: scheme://netloc domain root
         """
-        normalized_url = url
+        normalized_url = url.strip()
         if not normalized_url.lower().startswith("http://") and not normalized_url.lower().startswith("https://"):
             normalized_url = "http://" + normalized_url
 
@@ -166,116 +192,26 @@ class ArchiveBackend:
             return "Unknown"
         c = code.lower()
         mapping = {
-            "af": "Afrikaans",
-            "sq": "Albanian",
-            "am": "Amharic",
-            "ar": "Arabic",
-            "hy": "Armenian",
-            "az": "Azerbaijani",
-            "eu": "Basque",
-            "be": "Belarusian",
-            "bn": "Bengali",
-            "bs": "Bosnian",
-            "bg": "Bulgarian",
-            "ca": "Catalan",
-            "ceb": "Cebuano",
-            "ny": "Chichewa",
-            "zh-cn": "Chinese (Simplified)",
-            "zh-tw": "Chinese (Traditional)",
-            "zh": "Chinese",
-            "co": "Corsican",
-            "hr": "Croatian",
-            "cs": "Czech",
-            "da": "Danish",
-            "nl": "Dutch",
-            "en": "English",
-            "eo": "Esperanto",
-            "et": "Estonian",
-            "tl": "Filipino",
-            "fi": "Finnish",
-            "fr": "French",
-            "fy": "Frisian",
-            "gl": "Galician",
-            "ka": "Georgian",
-            "de": "German",
-            "el": "Greek",
-            "gu": "Gujarati",
-            "ht": "Haitian Creole",
-            "ha": "Hausa",
-            "haw": "Hawaiian",
-            "iw": "Hebrew",
-            "he": "Hebrew",
-            "hi": "Hindi",
-            "hmn": "Hmong",
-            "hu": "Hungarian",
-            "is": "Icelandic",
-            "ig": "Igbo",
-            "id": "Indonesian",
-            "ga": "Irish",
-            "it": "Italian",
-            "ja": "Japanese",
-            "jw": "Javanese",
-            "kn": "Kannada",
-            "kk": "Kazakh",
-            "km": "Khmer",
-            "ko": "Korean",
-            "ku": "Kurdish",
-            "ky": "Kyrgyz",
-            "lo": "Lao",
-            "la": "Latin",
-            "lv": "Latvian",
-            "lt": "Lithuanian",
-            "lb": "Luxembourgish",
-            "mk": "Macedonian",
-            "mg": "Malagasy",
-            "ms": "Malay",
-            "ml": "Malayalam",
-            "mt": "Maltese",
-            "mi": "Maori",
-            "mr": "Marathi",
-            "mn": "Mongolian",
-            "my": "Myanmar (Burmese)",
-            "ne": "Nepali",
-            "no": "Norwegian",
-            "ps": "Pashto",
-            "fa": "Persian",
-            "pl": "Polish",
-            "pt": "Portuguese",
-            "pt-br": "Portuguese - Brazil",
-            "pt-pt": "Portuguese - Portugal",
-            "pa": "Punjabi",
-            "ro": "Romanian",
-            "ru": "Russian",
-            "sm": "Samoan",
-            "gd": "Scots Gaelic",
-            "sr": "Serbian",
-            "st": "Sesotho",
-            "sn": "Shona",
-            "sd": "Sindhi",
-            "si": "Sinhala",
-            "sk": "Slovak",
-            "sl": "Slovenian",
-            "so": "Somali",
-            "es": "Spanish",
-            "es-419": "Spanish - Latin America",
-            "es-es": "Spanish - Spain",
-            "su": "Sundanese",
-            "sw": "Swahili",
-            "sv": "Swedish",
-            "tg": "Tajik",
-            "ta": "Tamil",
-            "te": "Telugu",
-            "th": "Thai",
-            "tr": "Turkish",
-            "uk": "Ukrainian",
-            "ur": "Urdu",
-            "uz": "Uzbek",
-            "vi": "Vietnamese",
-            "cy": "Welsh",
-            "xh": "Xhosa",
-            "yi": "Yiddish",
-            "yo": "Yoruba",
-            "zu": "Zulu",
+            "af": "Afrikaans", "sq": "Albanian", "am": "Amharic", "ar": "Arabic", "hy": "Armenian",
+            "az": "Azerbaijani", "eu": "Basque", "be": "Belarusian", "bn": "Bengali", "bs": "Bosnian",
+            "bg": "Bulgarian", "ca": "Catalan", "ceb": "Cebuano", "ny": "Chichewa", "zh-cn": "Chinese (Simplified)",
+            "zh-tw": "Chinese (Traditional)", "zh": "Chinese", "co": "Corsican", "hr": "Croatian", "cs": "Czech",
+            "da": "Danish", "nl": "Dutch", "en": "English", "eo": "Esperanto", "et": "Estonian", "tl": "Filipino",
+            "fi": "Finnish", "fr": "French", "fy": "Frisian", "gl": "Galician", "ka": "Georgian", "de": "German",
+            "el": "Greek", "gu": "Gujarati", "ht": "Haitian Creole", "ha": "Hausa", "haw": "Hawaiian",
+            "iw": "Hebrew", "he": "Hebrew", "hi": "Hindi", "hmn": "Hmong", "hu": "Hungarian", "is": "Icelandic",
+            "ig": "Igbo", "id": "Indonesian", "ga": "Irish", "it": "Italian", "ja": "Japanese", "jw": "Javanese",
+            "kn": "Kannada", "kk": "Kazakh", "km": "Khmer", "ko": "Korean", "ku": "Kurdish", "ky": "Kyrgyz",
+            "lo": "Lao", "la": "Latin", "lv": "Latvian", "lt": "Lithuanian", "lb": "Luxembourgish", "mk": "Macedonian",
+            "mg": "Malagasy", "ms": "Malay", "ml": "Malayalam", "mt": "Maltese", "mi": "Maori", "mr": "Marathi",
+            "mn": "Mongolian", "my": "Myanmar (Burmese)", "ne": "Nepali", "no": "Norwegian", "ps": "Pashto",
+            "fa": "Persian", "pl": "Polish", "pt": "Portuguese", "pt-br": "Portuguese - Brazil", "pt-pt": "Portuguese - Portugal",
+            "pa": "Punjabi", "ro": "Romanian", "ru": "Russian", "sm": "Samoan", "gd": "Scots Gaelic", "sr": "Serbian",
+            "st": "Sesotho", "sn": "Shona", "sd": "Sindhi", "si": "Sinhala", "sk": "Slovak", "sl": "Slovenian",
+            "so": "Somali", "es": "Spanish", "es-419": "Spanish - Latin America", "es-es": "Spanish - Spain",
+            "su": "Sundanese", "sw": "Swahili", "sv": "Swedish", "tg": "Tajik", "ta": "Tamil", "te": "Telugu",
+            "th": "Thai", "tr": "Turkish", "uk": "Ukrainian", "ur": "Urdu", "uz": "Uzbek", "vi": "Vietnamese",
+            "cy": "Welsh", "xh": "Xhosa", "yi": "Yiddish", "yo": "Yoruba", "zu": "Zulu",
         }
         if c in mapping:
             return mapping[c]
@@ -289,131 +225,37 @@ class ArchiveBackend:
             return "en"
         n = name.strip().lower()
         rev = {
-            "afrikaans": "af",
-            "albanian": "sq",
-            "amharic": "am",
-            "arabic": "ar",
-            "armenian": "hy",
-            "azerbaijani": "az",
-            "basque": "eu",
-            "belarusian": "be",
-            "bengali": "bn",
-            "bosnian": "bs",
-            "bulgarian": "bg",
-            "catalan": "ca",
-            "cebuano": "ceb",
-            "chichewa": "ny",
-            "chinese": "zh",
-            "chinese (simplified)": "zh-cn",
-            "chinese (traditional)": "zh-tw",
-            "corsican": "co",
-            "croatian": "hr",
-            "czech": "cs",
-            "danish": "da",
-            "dutch": "nl",
-            "english": "en",
-            "esperanto": "eo",
-            "estonian": "et",
-            "filipino": "tl",
-            "finnish": "fi",
-            "french": "fr",
-            "frisian": "fy",
-            "galician": "gl",
-            "georgian": "ka",
-            "german": "de",
-            "greek": "el",
-            "gujarati": "gu",
-            "haitian creole": "ht",
-            "hausa": "ha",
-            "hawaiian": "haw",
-            "hebrew": "he",
-            "hindi": "hi",
-            "hmong": "hmn",
-            "hungarian": "hu",
-            "icelandic": "is",
-            "igbo": "ig",
-            "indonesian": "id",
-            "irish": "ga",
-            "italian": "it",
-            "japanese": "ja",
-            "javanese": "jw",
-            "kannada": "kn",
-            "kazakh": "kk",
-            "khmer": "km",
-            "korean": "ko",
-            "kurdish": "ku",
-            "kyrgyz": "ky",
-            "lao": "lo",
-            "latin": "la",
-            "latvian": "lv",
-            "lithuanian": "lt",
-            "luxembourgish": "lb",
-            "macedonian": "mk",
-            "malagasy": "mg",
-            "malay": "ms",
-            "malayalam": "ml",
-            "maltese": "mt",
-            "maori": "mi",
-            "marathi": "mr",
-            "mongolian": "mn",
-            "myanmar (burmese)": "my",
-            "nepali": "ne",
-            "norwegian": "no",
-            "pashto": "ps",
-            "persian": "fa",
-            "polish": "pl",
-            "portuguese": "pt",
-            "portuguese - brazil": "pt-br",
-            "portuguese - portugal": "pt-pt",
-            "punjabi": "pa",
-            "romanian": "ro",
-            "russian": "ru",
-            "samoan": "sm",
-            "scots gaelic": "gd",
-            "serbian": "sr",
-            "sesotho": "st",
-            "shona": "sn",
-            "sindhi": "sd",
-            "sinhala": "si",
-            "slovak": "sk",
-            "slovenian": "sl",
-            "somali": "so",
-            "spanish": "es",
-            "spanish - latin america": "es-419",
-            "spanish - spain": "es-es",
-            "sundanese": "su",
-            "swahili": "sw",
-            "swedish": "sv",
-            "tajik": "tg",
-            "tamil": "ta",
-            "telugu": "te",
-            "thai": "th",
-            "turkish": "tr",
-            "ukrainian": "uk",
-            "urdu": "ur",
-            "uzbek": "uz",
-            "vietnamese": "vi",
-            "welsh": "cy",
-            "xhosa": "xh",
-            "yiddish": "yi",
-            "yoruba": "yo",
-            "zulu": "zu",
+            "afrikaans": "af", "albanian": "sq", "amharic": "am", "arabic": "ar", "armenian": "hy",
+            "azerbaijani": "az", "basque": "eu", "belarusian": "be", "bengali": "bn", "bosnian": "bs",
+            "bulgarian": "bg", "catalan": "ca", "cebuano": "ceb", "chichewa": "ny", "chinese": "zh",
+            "chinese (simplified)": "zh-cn", "chinese (traditional)": "zh-tw", "corsican": "co", "croatian": "hr",
+            "czech": "cs", "danish": "da", "dutch": "nl", "english": "en", "esperanto": "eo", "estonian": "et",
+            "filipino": "tl", "finnish": "fi", "french": "fr", "frisian": "fy", "galician": "gl", "georgian": "ka",
+            "german": "de", "greek": "el", "gujarati": "gu", "haitian creole": "ht", "hausa": "ha", "hawaiian": "haw",
+            "hebrew": "he", "hindi": "hi", "hmong": "hmn", "hungarian": "hu", "icelandic": "is", "igbo": "ig",
+            "indonesian": "id", "irish": "ga", "italian": "it", "japanese": "ja", "javanese": "jw", "kannada": "kn",
+            "kazakh": "kk", "khmer": "km", "ko": "Korean", "kurdish": "ku", "ky": "Kyrgyz", "lao": "lo",
+            "latin": "la", "lv": "lv", "lithuanian": "lt", "luxembourgish": "lb", "macedonian": "mk",
+            "malagasy": "mg", "malay": "ms", "malayalam": "ml", "maltese": "mt", "maori": "mi", "marathi": "mr",
+            "mongolian": "mn", "myanmar (burmese)": "my", "nepali": "ne", "norwegian": "no", "pashto": "ps",
+            "persian": "fa", "polish": "pl", "portuguese": "pt", "portuguese - brazil": "pt-br", "portuguese - portugal": "pt-pt",
+            "punjabi": "pa", "romanian": "ro", "russian": "ru", "samoan": "sm", "scots gaelic": "gd", "serbian": "sr",
+            "sesotho": "st", "shona": "sn", "sindhi": "sd", "sinhala": "si", "sk": "sk", "slovenian": "sl",
+            "somali": "so", "spanish": "es", "spanish - latin america": "es-419", "spanish - spain": "es-es",
+            "sundanese": "su", "sw": "sw", "swedish": "sv", "tajik": "tg", "tamil": "ta", "telugu": "te",
+            "thai": "th", "turkish": "tr", "ukrainian": "uk", "urdu": "ur", "uzbek": "uz", "vietnamese": "vi",
+            "welsh": "cy", "xh": "xh", "yiddish": "yi", "yoruba": "yo", "zulu": "zu",
         }
         return rev.get(n, "en")
 
     def google_search(self, query: str, num_results: int = 100, language: str = "en") -> list:
-        """Fetch up to `num_results` results from Google CSE.
-
-        Returns a list of URL strings. Requires `cse_key` and `cse_id` in Streamlit secrets.
-        """
+        """Fetch up to `num_results` results from Google CSE."""
         api_key = st.secrets.get("cse_key")
         cse_id = st.secrets.get("cse_id")
 
-        # Accept full language names (e.g., "English", "Hebrew") and map to codes
         if not language:
             language_code = "en"
         else:
-            # if a full name was provided, convert to code
             if len(language) > 2 and not ("-" in language and len(language) <= 5):
                 language_code = self._lang_name_to_code(language)
             else:
@@ -470,14 +312,7 @@ class ArchiveBackend:
         return all_results
 
     def evaluate_payload(self, payload: dict, good_keywords: list | None = None) -> dict:
-        """Apply auto-evaluation rules to a scraped payload and set status/status_details.
-
-        Rules implemented:
-        - Hostname endswith `.il` => Approved
-        - Detected languages include Hebrew (`he`) => Approved
-        - Any `good_keywords` found in title/description (orig or english) => Approved
-        Otherwise status is `Not sure`.
-        """
+        """Apply auto-evaluation rules to a scraped payload and set status/status_details."""
         approved = False
 
         url = payload.get("url") or ""
@@ -497,10 +332,6 @@ class ArchiveBackend:
                     approved = True
                     break
 
-        # Determine status details priority:
-        # 1) good keywords found -> "Found X good keywords"
-        # 2) .il domain -> ".il suffix"
-        # 3) Hebrew detected -> "Hebrew"
         kw_count = 0
         if good_keywords:
             text_fields = " ".join([str(payload.get(k) or "") for k in ("title", "description", "title_english", "description_english")]).lower()
@@ -521,13 +352,8 @@ class ArchiveBackend:
         return payload
 
     def domain_exists(self, domain_url: str) -> bool:
-        """Check whether a domain already exists in `DOMAINS`.
-
-        Accepts a normalized domain netloc (no scheme, no leading www), e.g. `example.com`.
-        This will check common stored variants (with http/https and with/without www).
-        """
+        """Check whether a domain already exists in `DOMAINS`."""
         try:
-            # Prepare variants to check against stored `url` column
             variants = [
                 domain_url,
                 f"http://{domain_url}",
@@ -548,21 +374,16 @@ class ArchiveBackend:
                 if resp and getattr(resp, 'data', None):
                     if resp.data:
                         return True
-
             return False
         except Exception:
             return False
 
     def insert_domain(self, payload: dict):
-        """Upserts processed metadata into the DOMAINS table."""
-        # Ensure timestamps use Jerusalem timezone
-        try:
-            now_iso = self._now_jerusalem_iso()
-            if not payload.get("created_at"):
-                payload["created_at"] = now_iso
-            payload["updated_at"] = now_iso
-        except Exception:
-            pass
+        """Upserts processed metadata into the DOMAINS table using strictly Jerusalem time."""
+        now_iso = self._now_jerusalem_iso()
+        if not payload.get("created_at"):
+            payload["created_at"] = now_iso
+        payload["updated_at"] = now_iso
 
         return (
             self.supabase.table("DOMAINS")
@@ -598,14 +419,12 @@ class ArchiveBackend:
         """Executes a compound multi-column advanced filter search query."""
         query_builder = self.supabase.table("DOMAINS").select("*")
 
-        # Handle text search constraints
         if filters.get("text_query"):
             match_str = f"%{filters['text_query']}%"
             query_builder = query_builder.or_(
                 f"url.ilike.{match_str},title.ilike.{match_str},description.ilike.{match_str},title_english.ilike.{match_str},description_english.ilike.{match_str}"
             )
 
-        # Handle relational filter tags
         if filters.get("status"):
             query_builder = query_builder.eq("status", filters["status"])
             
@@ -615,7 +434,6 @@ class ArchiveBackend:
         response = query_builder.order("id", desc=True).execute()
         data = response.data
 
-        # Post-filter languages dictionary structure since Supabase stores it as JSONB
         if filters.get("language") and data:
             target_lang = filters["language"].lower()
             data = [
@@ -630,10 +448,7 @@ class ArchiveBackend:
     # =========================================================================
 
     def analyze_keywords_before_saving(self, words: list) -> list:
-        """
-        Splits text input and runs language detection on each word token.
-        Returns an analyzed structured array for UI modification.
-        """
+        """Splits text input and runs language detection on each word token."""
         analyzed_list = []
         for word in words:
             word_clean = word.strip()
@@ -653,12 +468,11 @@ class ArchiveBackend:
         return analyzed_list
 
     def insert_final_keywords(self, payloads: list) -> dict:
-        """Saves a prepared and finalized payload batch directly to the database."""
+        """Saves a prepared and finalized payload batch using strictly Jerusalem time."""
         if not payloads:
             return {"success": False, "message": "No data provided."}
 
         try:
-            # stamp created_at for each payload using Jerusalem timezone
             now_iso = self._now_jerusalem_iso()
             for p in payloads:
                 if not p.get("created_at"):
