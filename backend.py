@@ -116,22 +116,22 @@ class ArchiveBackend:
         description = desc_tag["content"].strip() if desc_tag and desc_tag.get("content") else ""
 
         # Language Detection
-        detected_langs = {}
+        detected_langs = []
         combined_text = f"{title} {description}".strip()
 
         if combined_text:
             try:
                 predictions = detect_langs(combined_text)
-                detected_langs = {self._lang_code_to_name(p.lang): round(p.prob, 2) for p in predictions}
+                detected_langs = [self._lang_code_to_name(p.lang) for p in predictions]
             except Exception:
-                detected_langs = {"Unknown": 1.0}
+                detected_langs = ["Unknown"]
         else:
-            detected_langs = None
+            detected_langs = []
 
         # Translation Management
         title_english = title
         description_english = description
-        dominant_lang = list(detected_langs.keys())[0] if detected_langs else "en"
+        dominant_lang = detected_langs[0] if detected_langs else "en"
 
         if detected_langs and dominant_lang != "en":
             try:
@@ -321,8 +321,12 @@ class ArchiveBackend:
         if hostname.endswith(".il"):
             approved = True
 
-        languages = payload.get("languages") or {}
-        if any("hebrew" in str(l).lower() for l in languages.keys()):
+        languages = payload.get("languages") or []
+        if isinstance(languages, dict):
+            language_items = list(languages.keys())
+        else:
+            language_items = languages
+        if any("hebrew" in str(l).lower() for l in language_items):
             approved = True
 
         if good_keywords:
@@ -341,7 +345,7 @@ class ArchiveBackend:
 
         if hostname.endswith(".il"):
             payload["status_details"] = ".il suffix"
-        elif any("hebrew" in str(l).lower() for l in languages.keys()):
+        elif any("hebrew" in str(l).lower() for l in language_items):
             payload["status_details"] = "Hebrew"
         elif kw_count > 0:
             payload["status_details"] = f"Found {kw_count} good keywords"
@@ -437,8 +441,11 @@ class ArchiveBackend:
         if filters.get("language") and data:
             target_lang = filters["language"].lower()
             data = [
-                row for row in data 
-                if isinstance(row.get("languages"), dict) and target_lang in row["languages"]
+                row for row in data
+                if (
+                    (isinstance(row.get("languages"), dict) and target_lang in row["languages"])
+                    or (isinstance(row.get("languages"), list) and any(str(lang).lower() == target_lang for lang in row.get("languages", [])))
+                )
             ]
 
         return data

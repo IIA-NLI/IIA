@@ -3,6 +3,7 @@ import pandas as pd
 from backend import ArchiveBackend
 from urllib.parse import urlparse
 import time
+import re
 
 # --- PAGE SETUP ---
 st.set_page_config(
@@ -99,9 +100,10 @@ if check_password():
                     else:
                         with st.spinner("Analyzing and parsing remote server contents..."):
                             scraped_payload = backend.analyze_and_extract_url(normalized_url)
-                            st.session_state["current_payload"] = scraped_payload
-                            st.session_state["show_editor"] = True
-                            st.session_state["manual_domain_exists"] = False
+                        scraped_payload["link"] = normalized_url
+                        st.session_state["current_payload"] = scraped_payload
+                        st.session_state["show_editor"] = True
+                        st.session_state["manual_domain_exists"] = False
 
         if st.session_state.get("manual_url_needs_choice"):
             st.warning(
@@ -131,6 +133,7 @@ if check_password():
                 else:
                     with st.spinner("Analyzing and parsing remote server contents..."):
                         scraped_payload = backend.analyze_and_extract_url(analysis_url)
+                        scraped_payload["link"] = analysis_url
                         st.session_state["current_payload"] = scraped_payload
                         st.session_state["show_editor"] = True
                         st.session_state["manual_domain_exists"] = False
@@ -149,6 +152,7 @@ if check_password():
                 if existing_choice == "Reanalyze and update":
                     with st.spinner("Reanalyzing existing domain..."):
                         scraped_payload = backend.analyze_and_extract_url(st.session_state.get("manual_pending_url"))
+                        scraped_payload["link"] = st.session_state.get("manual_pending_url")
                         st.session_state["current_payload"] = scraped_payload
                         st.session_state["show_editor"] = True
                 else:
@@ -163,7 +167,7 @@ if check_password():
 
             st.write("---")
             st.subheader("🔍 Review and Edit Extracted Metadata")
-            st.markdown(f"**Chosen URL:** `{chosen_url}`")
+            st.markdown(f"**URL:** {payload.get('link', chosen_url)}")
 
             with st.form("metadata_edit_form"):
                 col1, col2 = st.columns(2)
@@ -180,11 +184,13 @@ if check_password():
                     st.text_area("Extracted Description", value=payload["description"] or "", disabled=True)
 
                 with col2:
-                    detected_langs_list = (
-                        list(payload["languages"].keys())
-                        if isinstance(payload.get("languages"), dict)
-                        else []
-                    )
+                    languages_data = payload.get("languages")
+                    detected_langs_list = []
+                    if isinstance(languages_data, list):
+                        detected_langs_list = languages_data
+                    elif isinstance(languages_data, dict):
+                        detected_langs_list = list(languages_data.keys())
+
                     edited_langs_str = st.text_input("Languages List (comma-separated)", value=", ".join(detected_langs_list))
 
                     st.text_input("English Title Translation", value=payload["title_english"] or "", disabled=True)
@@ -197,12 +203,9 @@ if check_password():
 
                     payload["status"] = edited_status
                     payload["status_details"] = edited_status_details
-                    payload["languages"] = (
-                        {lang: 1.0 for lang in cleaned_langs}
-                        if cleaned_langs
-                        else None
-                    )
+                    payload["languages"] = cleaned_langs if cleaned_langs else None
 
+                    payload.pop("link", None)
                     try:
                         backend.insert_domain(payload)
                         st.success(f"Successfully registered **{payload['url']}** to the Database!")
@@ -222,6 +225,18 @@ if check_password():
                     all_rows = backend.get_all_domains()
                     if all_rows:
                         df = pd.DataFrame(all_rows)
+                        if "languages" in df.columns:
+                            def normalize_langs(value):
+                                if isinstance(value, list):
+                                    return ", ".join(str(v) for v in value)
+                                if isinstance(value, dict):
+                                    return ", ".join(str(k) for k in value.keys())
+                                if value is None:
+                                    return ""
+                                return str(value)
+
+                            df["languages"] = df["languages"].apply(normalize_langs)
+
                         ordered_cols = ["id", "url", "status", "status_details", "response_code", "title", "title_english", "languages", "source", "updated_at"]
                         existing_cols = [c for c in ordered_cols if c in df.columns]
                         df = df[existing_cols]
@@ -304,7 +319,12 @@ if check_password():
                                 edited_title_en = st.text_input("English Title:", value=row.get("title_english") or "")
                                 edited_description_en = st.text_area("English Description:", value=row.get("description_english") or "")
                                 langs_value = row.get("languages")
-                                langs_csv = ", ".join(langs_value.keys()) if isinstance(langs_value, dict) else str(langs_value)
+                                if isinstance(langs_value, dict):
+                                    langs_csv = ", ".join(langs_value.keys())
+                                elif isinstance(langs_value, list):
+                                    langs_csv = ", ".join(str(l) for l in langs_value)
+                                else:
+                                    langs_csv = str(langs_value)
                                 edited_langs = st.text_input("Languages (comma-separated):", value=langs_csv)
 
                                 save_btn = st.form_submit_button("Save changes")
@@ -402,6 +422,7 @@ if check_password():
                 domain_to_keyword = {}
                 root_urls = []
                 seen = set()
+                domain_to_original_link = {}
 
                 for link, kw in all_links:
                     raw = link
@@ -437,6 +458,7 @@ if check_password():
                     seen.add(domain_key)
                     root_urls.append(domain_root)
                     domain_to_keyword[domain_root] = kw
+                    domain_to_original_link[domain_root] = raw
 
                 unique_links = root_urls
                 st.success(f"Collected {len(unique_links)} unique domain roots from search results.")
@@ -444,13 +466,16 @@ if check_password():
                 try:
                     kw_rows = backend.get_all_keywords() or []
                     good_kw_list = [r["word"] for r in kw_rows if r.get("good")]
+                    bad_kw_list = [r["word"] for r in kw_rows if r.get("good") is False]
                 except Exception:
                     good_kw_list = []
+                    bad_kw_list = []
 
                 processed = []
 
                 for link in unique_links:
                     originating_kw = domain_to_keyword.get(link)
+                    original_full_url = domain_to_original_link.get(link, link)
 
                     try:
                         payload = backend.analyze_and_extract_url(link)
@@ -458,31 +483,26 @@ if check_password():
                         st.error(f"Failed to analyze {link}: {e}")
                         continue
 
+                    payload["link"] = original_full_url
                     if originating_kw:
                         payload["source"] = f"Google search for {originating_kw}"
 
-                    try:
-                        payload = backend.evaluate_payload(payload, good_keywords=good_kw_list)
-                    except Exception:
-                        approved = False
-                        parsed = urlparse(payload.get("url") or link)
-                        hostname = parsed.hostname or ""
+                    text_fields = " ".join([str(payload.get(k) or "") for k in ("title", "description", "title_english", "description_english")]).lower()
+                    good_matches = sum(1 for kw in good_kw_list if kw.lower() in text_fields)
+                    bad_matches = sum(1 for kw in bad_kw_list if kw.lower() in text_fields)
 
-                        if hostname.lower().endswith(".il"):
-                            approved = True
-
-                        languages = payload.get("languages") or {}
-                        if any("hebrew" in str(l).lower() or str(l).lower().startswith("he") for l in languages.keys()):
-                            approved = True
-
-                        text_fields = " ".join([str(payload.get(k) or "") for k in ("title", "description", "title_english", "description_english")]).lower()
-                        for gkw in good_kw_list:
-                            if gkw.lower() in text_fields:
-                                approved = True
-                                break
-
-                        payload["status"] = "Approved" if approved else "Not sure"
-                        payload["status_details"] = "Auto-evaluated via keyword search"
+                    if good_matches >= 1 and bad_matches >= 1:
+                        payload["status"] = "Not sure"
+                        payload["status_details"] = f"{good_matches} good keywords and {bad_matches} bad keywords"
+                    elif bad_matches >= 1:
+                        payload["status"] = "Not relevant"
+                        payload["status_details"] = f"{bad_matches} bad keyword{'s' if bad_matches != 1 else ''} matched"
+                    elif good_matches >= 1:
+                        payload["status"] = "Approved"
+                        payload["status_details"] = f"{good_matches} good keyword{'s' if good_matches != 1 else ''} matched"
+                    else:
+                        payload["status"] = "Not sure"
+                        payload["status_details"] = "0 good keywords and 0 bad keywords"
 
                     processed.append(payload)
 
@@ -500,6 +520,14 @@ if check_password():
             approved_count = len([p for p in ordered_processed if p.get("status") == "Approved"])
             unknown_count = len([p for p in ordered_processed if p.get("status") != "Approved"])
 
+            try:
+                kw_rows = backend.get_all_keywords() or []
+                good_kw_list = [r["word"] for r in kw_rows if r.get("good")]
+                bad_kw_list = [r["word"] for r in kw_rows if r.get("good") is False]
+            except Exception:
+                good_kw_list = []
+                bad_kw_list = []
+
             st.subheader("Processed Results")
             st.write(f"Auto-approved: {approved_count} | Unknowns requiring review: {unknown_count}")
 
@@ -510,6 +538,7 @@ if check_password():
                     url = p.get("url") or "Unknown URL"
 
                     with st.expander(f"{prefix}{url} — {title}", expanded=(p.get("status") != "Approved")):
+                        st.markdown(f"**Original URL:** {p.get('link')}")
                         st.markdown(f"**Source:** {p.get('source')}")
                         st.write(f"**Response Code:** `{p.get('response_code')}`")
                         st.markdown(f"**Original Title:** {p.get('title')}")
@@ -517,11 +546,22 @@ if check_password():
                         st.markdown(f"**Original Description:** {p.get('description')}")
                         st.markdown(f"**English Description:** {p.get('description_english')}")
 
+                        text_fields = " ".join([str(p.get(k) or "") for k in ("title", "description", "title_english", "description_english")]).lower()
+                        matched_good = [kw for kw in good_kw_list if kw.lower() in text_fields]
+                        matched_bad = [kw for kw in bad_kw_list if kw.lower() in text_fields]
+
+                        st.markdown(f"**Good keywords:** {', '.join(matched_good) if matched_good else 'None'}")
+                        st.markdown(f"**Bad keywords:** {', '.join(matched_bad) if matched_bad else 'None'}")
+
                         default_idx = status_options.index(p.get("status")) if p.get("status") in status_options else 1
 
                         st.selectbox("Select Status:", options=status_options, index=default_idx, key=f"status_{i}")
                         st.text_input("Status Details:", value=p.get("status_details") or "", key=f"details_{i}")
-                        langs_csv = ", ".join(list((p.get("languages") or {}).keys()))
+                        langs_data = p.get("languages") or []
+                        if isinstance(langs_data, dict):
+                            langs_csv = ", ".join(list(langs_data.keys()))
+                        else:
+                            langs_csv = ", ".join(langs_data)
                         st.text_input("Languages (comma-separated):", value=langs_csv, key=f"langs_{i}")
 
                 commit_all = st.form_submit_button("Commit All to Archive", key="commit_all_btn")
@@ -534,7 +574,10 @@ if check_password():
 
                     status = st.session_state.get(f"status_{i}", updated_payload.get("status"))
                     details = st.session_state.get(f"details_{i}", updated_payload.get("status_details"))
-                    langs_str = st.session_state.get(f"langs_{i}", ", ".join(list((updated_payload.get("languages") or {}).keys())))
+                    default_langs = updated_payload.get("languages") or []
+                    if isinstance(default_langs, dict):
+                        default_langs = list(default_langs.keys())
+                    langs_str = st.session_state.get(f"langs_{i}", ", ".join(default_langs))
 
                     cleaned_langs = [l.strip() for l in langs_str.split(",") if l.strip()]
 
@@ -545,7 +588,7 @@ if check_password():
                         updated_payload["status_details"] = details or updated_payload.get("status_details")
 
                     if cleaned_langs:
-                        updated_payload["languages"] = {lang: 1.0 for lang in cleaned_langs}
+                        updated_payload["languages"] = cleaned_langs
                     else:
                         updated_payload["languages"] = None
 
@@ -555,6 +598,7 @@ if check_password():
                     saved = 0
                     for item in to_commit:
                         try:
+                            item.pop("link", None)
                             backend.insert_domain(item)
                             saved += 1
                         except Exception as e:
@@ -577,48 +621,49 @@ if check_password():
         with st.form("kw_input_form"):
             raw_input = st.text_area("Keywords (separated with commas)", placeholder="e.g., חדשות, security, archive, ספורט")
             keyword_type = st.radio("Classification Evaluation:", ["Good Keyword (Whitelisted)", "Bad Keyword (Flagged)"], horizontal=True)
-            analyze_kw_btn = st.form_submit_button("Analyze Keywords")
+            analyze_kw_btn = st.form_submit_button("Add Keywords")
 
         if analyze_kw_btn:
             if not raw_input.strip():
                 st.warning("Please supply words to analyze.")
             else:
-                words_to_process = [w.strip() for w in raw_input.split(",") if w.strip()]
-                st.session_state["analyzed_keywords_batch"] = backend.analyze_keywords_before_saving(words_to_process)
-                st.session_state["is_good_kw_type"] = True if "Good" in keyword_type else False
-                st.session_state["show_kw_editor"] = True
+                # Allow keywords separated by commas or newlines
+                words_to_process = [w.strip() for w in re.split(r"[,\n]+", raw_input) if w.strip()]
 
-        if st.session_state.get("show_kw_editor"):
-            st.write("---")
-            st.subheader("2. Review & Edit Detected Languages")
+                # Deduplicate by case-insensitive word to avoid ON CONFLICT multi-row errors
+                unique = {}
+                is_good = True if "Good" in keyword_type else False
+                for word in words_to_process:
+                    key = word.lower()
+                    unique[key] = {"word": word, "good": is_good}
 
-            with st.form("kw_edit_form"):
-                final_payloads = []
-                for idx, item in enumerate(st.session_state["analyzed_keywords_batch"]):
-                    st.markdown(f"**Word:** `{item['word']}`")
-                    edited_lang_csv = st.text_input(f"Languages for '{item['word']}'", value=", ".join(item["languages_list"]), key=f"kw_lang_{idx}")
-                    
-                    cleaned_langs = [l.strip() for l in edited_lang_csv.split(",") if l.strip()]
-                    langs_dict = {lang: 1.0 for lang in cleaned_langs} if cleaned_langs else None
-                    
-                    final_payloads.append({
-                        "word": item["word"],
-                        "good": st.session_state["is_good_kw_type"],
-                        "language": langs_dict
-                    })
+                payloads = list(unique.values())
 
-                commit_kws = st.form_submit_button("Commit Finalized Keywords to DB")
+                try:
+                    res = backend.insert_final_keywords(payloads)
+                    if res.get("success"):
+                        st.success(f"Successfully processed and synced **{res.get('count', 0)}** keywords!")
+                        with st.spinner("Refreshing..."):
+                            time.sleep(2)
+                        st.rerun()
+                except Exception as k_err:
+                    err_str = str(k_err)
+                    # Fallback: try inserting entries one-by-one to avoid batch upsert conflict
+                    saved = 0
+                    for p in payloads:
+                        try:
+                            backend.insert_final_keywords([p])
+                            saved += 1
+                        except Exception:
+                            continue
 
-                if commit_kws:
-                    try:
-                        res = backend.insert_final_keywords(final_payloads)
-                        if res["success"]:
-                            st.success(f"Successfully processed and synced **{res['count']}** keywords!")
-                            st.session_state["show_kw_editor"] = False
-                            del st.session_state["analyzed_keywords_batch"]
-                            st.rerun()
-                    except Exception as k_err:
-                        st.error(f"Failed to submit configuration: {k_err}")
+                    if saved:
+                        st.success(f"Partially saved {saved} keywords (fallback individual inserts).")
+                        with st.spinner("Refreshing..."):
+                            time.sleep(2)
+                        st.rerun()
+                    else:
+                        st.error(f"Failed to submit keywords: {k_err}")
 
     # --- VIEW 4B: VIEW KEYWORDS DATABASE ---
     elif option == "🏷️ Keywords Database Explorer":
@@ -637,16 +682,61 @@ if check_password():
                 elif "Bad" in view_mode:
                     kw_df = kw_df[kw_df["good"] == False]
 
-                display_df = kw_df[["id", "word", "evaluation", "language", "created_at"]]
-                st.dataframe(display_df, use_container_width=True, hide_index=True)
-                
-                with st.expander("🗑️ Delete Database Keyword Entry"):
-                    remove_id = st.number_input("Target Keyword ID to Remove", step=1, value=0)
-                    remove_btn = st.button("Delete Selected ID Key", type="secondary")
-                    if remove_btn and remove_id > 0:
-                        backend.delete_keyword(int(remove_id))
-                        st.success(f"Row item reference {remove_id} deleted successfully.")
-                        st.rerun()
+                # Search / filter bar for the displayed keywords
+                search_q = st.text_input("Filter keywords:", placeholder="Type to filter by word or evaluation")
+
+                if search_q and isinstance(search_q, str) and search_q.strip():
+                    mask = (
+                        kw_df["word"].astype(str).str.contains(search_q, case=False, na=False)
+                        | kw_df["evaluation"].astype(str).str.contains(search_q, case=False, na=False)
+                    )
+                    filtered_df = kw_df[mask].reset_index(drop=True)
+                else:
+                    filtered_df = kw_df.copy().reset_index(drop=True)
+
+                # Render table with an inline Delete column (buttons inside the table)
+                # Header
+                hdr_id, hdr_word, hdr_eval, hdr_created, hdr_del = st.columns([1, 4, 2, 2, 1])
+                hdr_id.markdown("**ID**")
+                hdr_word.markdown("**Word**")
+                hdr_eval.markdown("**Evaluation**")
+                hdr_created.markdown("**Created At**")
+                hdr_del.markdown("**Delete**")
+
+                for _, row in filtered_df.reset_index(drop=True).iterrows():
+                    kw_id = int(row["id"])
+                    kw_word = row["word"]
+                    kw_eval = row.get("evaluation", "")
+                    kw_created = row.get("created_at", "")
+
+                    col_id, col_word, col_eval, col_created, col_del = st.columns([1, 4, 2, 2, 1])
+                    col_id.write(kw_id)
+                    col_word.write(kw_word)
+                    col_eval.write(kw_eval)
+                    col_created.write(kw_created)
+
+                    with col_del:
+                        if st.button("Delete", key=f"delete_kw_{kw_id}"):
+                            st.session_state["pending_delete"] = kw_id
+                            st.session_state["pending_delete_word"] = kw_word
+
+                        if st.session_state.get("pending_delete") == kw_id:
+                            st.warning(f"Confirm deletion of keyword '{kw_word}' (ID {kw_id})")
+                            c1, c2 = st.columns([1, 1])
+                            with c1:
+                                if st.button("Confirm", key=f"confirm_delete_{kw_id}"):
+                                    try:
+                                        backend.delete_keyword(kw_id)
+                                        st.success(f"Deleted keyword {kw_id}: {kw_word}")
+                                        st.session_state.pop("pending_delete", None)
+                                        st.session_state.pop("pending_delete_word", None)
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"Failed to delete {kw_id}: {e}")
+                            with c2:
+                                if st.button("Cancel", key=f"cancel_delete_{kw_id}"):
+                                    st.session_state.pop("pending_delete", None)
+                                    st.session_state.pop("pending_delete_word", None)
             else:
                 st.info("No records matching this keyword context exist.")
         except Exception as read_err:
