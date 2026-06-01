@@ -515,7 +515,7 @@ class ArchiveBackend:
         elif kw_count > 0:
             payload["status_details"] = f"Found {kw_count} good keywords"
         else:
-            payload["status_details"] = "Approved by user"
+            payload["status_details"] = "Determined by user"
 
         payload["status"] = "Approved" if approved else "Not sure"
         return payload

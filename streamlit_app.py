@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from backend import ArchiveBackend
 from urllib.parse import urlparse
+import time
 
 # --- PAGE SETUP ---
 st.set_page_config(
@@ -331,8 +332,6 @@ if check_password():
         st.header("🔍 Google Keyword Search & Ingest Tool")
 
         # google_search is provided by backend.google_search()
-
-        # UI for keyword-driven Google search
         st.write("This tool searches Google for keywords and offers an approval workflow for results.")
 
         language_options = {
@@ -352,11 +351,25 @@ if check_password():
             "Portuguese - Brazil (pt-BR)": "pt-BR",
             "Portuguese - Portugal (pt-PT)": "pt-PT",
             "Turkish": "tr",
-            "Polish (pl)": "pl"
+            "Polish (pl)": "pl",
         }
 
+        def clear_processed_review_state():
+            """Remove old review widgets/results so a new search starts cleanly."""
+            for key in list(st.session_state.keys()):
+                if (
+                    key.startswith("status_")
+                    or key.startswith("details_")
+                    or key.startswith("langs_")
+                ):
+                    del st.session_state[key]
+            st.session_state.pop("ordered_processed", None)
+
         with st.form("keywords_search_form"):
-            keywords_query = st.text_area("Keywords List:", help="Enter the keywords you want to search for. Use commas to separate multiple keywords.")
+            keywords_query = st.text_area(
+                "Keywords List:",
+                help="Enter the keywords you want to search for. Use commas to separate multiple keywords.",
+            )
 
             col1, col2 = st.columns(2)
             with col1:
@@ -374,19 +387,20 @@ if check_password():
             run_search = st.form_submit_button("Run Keyword Search")
 
         if run_search:
+            clear_processed_review_state()
+
             if not keywords_query.strip():
                 st.warning("Please provide keywords to search for.")
             else:
                 keywords = [k.strip() for k in keywords_query.split(",") if k.strip()]
                 all_links = []  # list of (link, keyword) tuples
+
                 for kw in keywords:
-                    q = kw
-                    if include_inurl:
-                        q = f"inurl:{kw}"
+                    q = f"inurl:{kw}" if include_inurl else kw
                     try:
                         links = backend.google_search(q, num_results=limit, language=language)
                     except Exception as e:
-                        st.error(f"Search failed: {e}")
+                        st.error(f"Search failed for '{kw}': {e}")
                         links = []
                     all_links.extend([(l, kw) for l in links])
 
@@ -395,32 +409,32 @@ if check_password():
                 domain_to_keyword = {}
                 root_urls = []
                 seen = set()
+
                 for link, kw in all_links:
                     raw = link
                     if not raw:
                         continue
                     if not raw.startswith("http://") and not raw.startswith("https://"):
                         raw = "http://" + raw
-                    p = urlparse(raw)
-                    # domain netloc normalized (lowercase, no leading www.)
-                    netloc = (p.netloc or "").lower()
-                    if netloc.startswith("www."):
-                        domain_key = netloc[4:]
-                    else:
-                        domain_key = netloc
 
+                    p = urlparse(raw)
+                    netloc = (p.netloc or "").lower()
+                    if not netloc:
+                        continue
+
+                    domain_key = netloc[4:] if netloc.startswith("www.") else netloc
                     domain_root = f"{p.scheme}://{p.netloc}"
 
-                    # If homepage_only requested, only include original links that were root/homepages
+                    # If homepage_only requested, only include original links that were root/homepages.
                     if homepage_only:
                         path = p.path.rstrip("/")
-                        if path and path != "":
+                        if path:
                             continue
 
                     if domain_key in seen:
                         continue
 
-                    # Skip if domain already exists in DB (check normalized domain_key)
+                    # Skip if domain already exists in DB (check normalized domain_key).
                     try:
                         if backend.domain_exists(domain_key):
                             continue
@@ -429,13 +443,12 @@ if check_password():
 
                     seen.add(domain_key)
                     root_urls.append(domain_root)
-                    # record first-seen keyword for this domain_key
                     domain_to_keyword[domain_root] = kw
 
                 unique_links = root_urls
                 st.success(f"Collected {len(unique_links)} unique domain roots from search results.")
 
-                # Load good keywords for 'good keyword' rule
+                # Load good keywords for the auto-evaluation rule.
                 try:
                     kw_rows = backend.get_all_keywords() or []
                     good_kw_list = [r["word"] for r in kw_rows if r.get("good")]
@@ -443,40 +456,45 @@ if check_password():
                     good_kw_list = []
 
                 processed = []
+
                 for link in unique_links:
-                    if homepage_only:
-                        p = urlparse(link)
-                        path = p.path.rstrip("/")
-                        if path and path != "":
-                            continue
+                    originating_kw = domain_to_keyword.get(link)
 
-                    # annotate source with originating keyword when available
-                    originating_kw = None
                     try:
-                        originating_kw = domain_to_keyword.get(link)
-                    except Exception:
-                        originating_kw = None
+                        payload = backend.analyze_and_extract_url(link)
+                    except Exception as e:
+                        st.error(f"Failed to analyze {link}: {e}")
+                        continue
 
-                    payload = backend.analyze_and_extract_url(link)
                     if originating_kw:
                         payload["source"] = f"Google search for {originating_kw}"
 
-                    # Evaluate payload using backend rules (sets status and status_details)
+                    # Evaluate payload using backend rules (sets status and status_details).
                     try:
                         payload = backend.evaluate_payload(payload, good_keywords=good_kw_list)
                     except Exception:
-                        # fallback to previous simple behavior
                         approved = False
                         parsed = urlparse(payload.get("url") or link)
                         hostname = parsed.hostname or ""
+
                         if hostname.lower().endswith(".il"):
                             approved = True
 
                         languages = payload.get("languages") or {}
-                        if any(l.lower().startswith("he") for l in languages.keys()):
+                        if any("hebrew" in str(l).lower() or str(l).lower().startswith("he") for l in languages.keys()):
                             approved = True
 
-                        text_fields = " ".join([str(payload.get(k) or "") for k in ("title", "description", "title_english", "description_english")]).lower()
+                        text_fields = " ".join(
+                            [
+                                str(payload.get(k) or "")
+                                for k in (
+                                    "title",
+                                    "description",
+                                    "title_english",
+                                    "description_english",
+                                )
+                            ]
+                        ).lower()
                         for gkw in good_kw_list:
                             if gkw.lower() in text_fields:
                                 approved = True
@@ -484,91 +502,120 @@ if check_password():
 
                         payload["status"] = "Approved" if approved else "Not sure"
                         payload["status_details"] = "Auto-evaluated via keyword search"
+
                     processed.append(payload)
 
-                # Show processed list and allow user to edit properties for ALL results
-                st.write("---")
-                status_options = ["Approved", "Not sure", "Not relevant"]
+                # Store results in session_state so the review form survives Streamlit reruns.
+                st.session_state["ordered_processed"] = (
+                    [p for p in processed if p.get("status") != "Approved"]
+                    + [p for p in processed if p.get("status") == "Approved"]
+                )
 
-                approved_count = len([p for p in processed if p.get("status") == "Approved"])
-                unknown_count = len([p for p in processed if p.get("status") != "Approved"])
-                st.subheader("Processed Results")
-                st.write(f"Auto-approved: {approved_count} | Unknowns requiring review: {unknown_count}")
+        ordered_processed = st.session_state.get("ordered_processed", [])
 
-                # Unified editable form for all processed results (auto-approved included)
-                # reorder so non-approved (unknowns) come first, approved items at the end
-                ordered_processed = [p for p in processed if p.get("status") != "Approved"] + [p for p in processed if p.get("status") == "Approved"]
+        if ordered_processed:
+            st.write("---")
+            status_options = ["Approved", "Not sure", "Not relevant"]
 
-                with st.form("processed_review_form"):
-                    for i, p in enumerate(ordered_processed):
-                        prefix = "✅ " if p.get("status") == "Approved" else ""
-                        with st.expander(f"{prefix}{p['url']} — {p.get('title') or p.get('title_english') or 'No Title'}", expanded=(p.get("status") != "Approved")):
-                            st.markdown(f"**Source:** {p.get('source')}")
-                            st.write(f"**Response Code:** `{p.get('response_code')}`")
-                            st.markdown(f"**Original Title:** {p.get('title')}")
-                            st.markdown(f"**English Title:** {p.get('title_english')}")
-                            st.markdown(f"**Original Description:** {p.get('description')}")
-                            st.markdown(f"**English Description:** {p.get('description_english')}")
+            approved_count = len([p for p in ordered_processed if p.get("status") == "Approved"])
+            unknown_count = len([p for p in ordered_processed if p.get("status") != "Approved"])
 
-                            default_idx = status_options.index(p.get('status')) if p.get('status') in status_options else 1
-                            selected_status = st.selectbox(
-                                "Select Status:",
-                                options=status_options,
-                                index=default_idx,
-                                key=f"status_{i}",
-                            )
-                            # Mirror widget values into session_state explicitly so they
-                            # are available when the form is submitted (robust across reruns).
-                            st.session_state[f"status_{i}"] = selected_status
+            st.subheader("Processed Results")
+            st.write(f"Auto-approved: {approved_count} | Unknowns requiring review: {unknown_count}")
 
-                            status_details = st.text_input(
-                                "Status Details:", value=p.get('status_details') or "", key=f"details_{i}"
-                            )
-                            st.session_state[f"details_{i}"] = status_details
+            with st.form("processed_review_form"):
+                for i, p in enumerate(ordered_processed):
+                    prefix = "✅ " if p.get("status") == "Approved" else ""
+                    title = p.get("title") or p.get("title_english") or "No Title"
+                    url = p.get("url") or "Unknown URL"
 
-                            # Allow editing detected languages for auto-approved and unknowns
-                            langs_csv = ", ".join(list((p.get('languages') or {}).keys()))
-                            edited_langs = st.text_input(
-                                "Languages (comma-separated):", value=langs_csv, key=f"langs_{i}"
-                            )
-                            st.session_state[f"langs_{i}"] = edited_langs
+                    with st.expander(
+                        f"{prefix}{url} — {title}",
+                        expanded=(p.get("status") != "Approved"),
+                    ):
+                        st.markdown(f"**Source:** {p.get('source')}")
+                        st.write(f"**Response Code:** `{p.get('response_code')}`")
+                        st.markdown(f"**Original Title:** {p.get('title')}")
+                        st.markdown(f"**English Title:** {p.get('title_english')}")
+                        st.markdown(f"**Original Description:** {p.get('description')}")
+                        st.markdown(f"**English Description:** {p.get('description_english')}")
 
-                    # give the submit button an explicit key to avoid collisions
-                    commit_all = st.form_submit_button("Commit All to Archive", key="commit_all_btn")
+                        default_idx = (
+                            status_options.index(p.get("status"))
+                            if p.get("status") in status_options
+                            else 1
+                        )
 
-                if commit_all:
-                    to_commit = []
-                    for i, p in enumerate(ordered_processed):
-                        # read back edited values from session_state
-                        status = st.session_state.get(f"status_{i}", p.get('status'))
-                        details = st.session_state.get(f"details_{i}", p.get('status_details'))
-                        langs_str = st.session_state.get(f"langs_{i}", ", ".join(list((p.get('languages') or {}).keys())))
+                        # Do NOT assign to st.session_state["status_i"] after this widget is created.
+                        # Streamlit owns widget-backed keys and raises StreamlitAPIException if
+                        # those keys are modified after widget instantiation in the same run.
+                        st.selectbox(
+                            "Select Status:",
+                            options=status_options,
+                            index=default_idx,
+                            key=f"status_{i}",
+                        )
 
-                        cleaned_langs = [l.strip() for l in langs_str.split(",") if l.strip()]
+                        st.text_input(
+                            "Status Details:",
+                            value=p.get("status_details") or "",
+                            key=f"details_{i}",
+                        )
 
-                        p['status'] = status
-                        if p['status'] == 'Approved':
-                            p['status_details'] = details or 'Determined by user'
-                        else:
-                            p['status_details'] = details or p.get('status_details')
+                        langs_csv = ", ".join(list((p.get("languages") or {}).keys()))
+                        st.text_input(
+                            "Languages (comma-separated):",
+                            value=langs_csv,
+                            key=f"langs_{i}",
+                        )
 
-                        if cleaned_langs:
-                            p['languages'] = {lang: 1.0 for lang in cleaned_langs}
+                commit_all = st.form_submit_button("Commit All to Archive", key="commit_all_btn")
 
-                        to_commit.append(p)
+            if commit_all:
+                to_commit = []
 
-                    if to_commit:
-                        saved = 0
-                        for item in to_commit:
-                            try:
-                                backend.insert_domain(item)
-                                saved += 1
-                            except Exception as e:
-                                st.error(f"Failed to save {item['url']}: {e}")
-                        if saved:
-                            st.success(f"Saved {saved} records to the archive.")
+                for i, p in enumerate(ordered_processed):
+                    updated_payload = p.copy()
+
+                    status = st.session_state.get(f"status_{i}", updated_payload.get("status"))
+                    details = st.session_state.get(
+                        f"details_{i}", updated_payload.get("status_details")
+                    )
+                    langs_str = st.session_state.get(
+                        f"langs_{i}",
+                        ", ".join(list((updated_payload.get("languages") or {}).keys())),
+                    )
+
+                    cleaned_langs = [l.strip() for l in langs_str.split(",") if l.strip()]
+
+                    updated_payload["status"] = status
+                    if updated_payload["status"] == "Approved":
+                        updated_payload["status_details"] = details or "Determined by user"
                     else:
-                        st.info("No records to commit.")
+                        updated_payload["status_details"] = details or updated_payload.get("status_details")
+
+                    if cleaned_langs:
+                        updated_payload["languages"] = {lang: 1.0 for lang in cleaned_langs}
+
+                    to_commit.append(updated_payload)
+
+                if to_commit:
+                    saved = 0
+                    for item in to_commit:
+                        try:
+                            backend.insert_domain(item)
+                            saved += 1
+                        except Exception as e:
+                            st.error(f"Failed to save {item.get('url')}: {e}")
+
+                    if saved:
+                        st.success(f"Saved {saved} records to the archive.")
+                        with st.spinner("Refreshing..."):
+                            time.sleep(5)
+                        clear_processed_review_state()
+                        st.rerun()
+                else:
+                    st.info("No records to commit.")
 
     # --- VIEW 4A: ADD/MANAGE KEYWORDS ---
     elif option == "🏷️ Add Keywords":
