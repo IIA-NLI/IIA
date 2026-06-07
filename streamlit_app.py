@@ -60,7 +60,7 @@ if check_password():
         "Choose App Tool Engine:",
         [
             "🌐 Add URLs using Search",
-            "🌐 Add a URL Manually", 
+            "🌐 Add URLs Manually", 
             "🌐 Domains Database Explorer", 
             "🏷️ Add Keywords",
             "🏷️ Keywords Database Explorer"
@@ -68,7 +68,7 @@ if check_password():
     )
 
     # --- VIEW 1: MANUAL URL INGESTION ---
-    if option == "🌐 Add a URL Manually":
+    if option == "🌐 Add URLs Manually":
         st.header("📝 Manual URL Extraction and Ingestion")
 
         good_kw_list, bad_kw_list = backend.get_keyword_lists()
