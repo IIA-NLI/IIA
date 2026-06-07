@@ -4,6 +4,7 @@ from backend import ArchiveBackend
 from urllib.parse import urlparse
 import time
 import re
+import datetime
 
 # --- PAGE SETUP ---
 st.set_page_config(
@@ -70,6 +71,8 @@ if check_password():
     if option == "🌐 Add a URL Manually":
         st.header("📝 Manual URL Extraction and Ingestion")
 
+        good_kw_list, bad_kw_list = backend.get_keyword_lists()
+
         with st.form("url_fetch_form"):
             input_url = st.text_input("Target URL", placeholder="example.co.il")
             fetch_btn = st.form_submit_button("Analyze Domain")
@@ -81,26 +84,31 @@ if check_password():
             elif not backend.is_valid_url_format(input_url):
                 st.error("❌ Invalid URL structure! Spaces or special characters are forbidden.")
             else:
-                normalized_url, domain_key, has_extra_path, trimmed_url = backend.normalize_manual_url(input_url)
+                manual_info = backend.prepare_manual_url(input_url)
 
-                if has_extra_path:
-                    st.session_state["manual_original_url"] = normalized_url
-                    st.session_state["manual_trimmed_url"] = trimmed_url
-                    st.session_state["manual_pending_domain"] = domain_key
+                if manual_info["has_extra_path"]:
+                    st.session_state["manual_original_url"] = manual_info["normalized_url"]
+                    st.session_state["manual_trimmed_url"] = manual_info["trimmed_url"]
+                    st.session_state["manual_pending_domain"] = manual_info["domain_key"]
                     st.session_state["manual_url_needs_choice"] = True
                     st.session_state["manual_domain_exists"] = False
                     st.session_state["show_editor"] = False
                 else:
                     st.session_state["manual_url_needs_choice"] = False
-                    st.session_state["manual_pending_url"] = normalized_url
-                    st.session_state["manual_pending_domain"] = domain_key
-                    if backend.domain_exists(domain_key):
+                    st.session_state["manual_pending_url"] = manual_info["normalized_url"]
+                    st.session_state["manual_pending_domain"] = manual_info["domain_key"]
+                    if manual_info["domain_exists"]:
                         st.session_state["manual_domain_exists"] = True
                         st.session_state["show_editor"] = False
                     else:
                         with st.spinner("Analyzing and parsing remote server contents..."):
-                            scraped_payload = backend.analyze_and_extract_url(normalized_url)
-                        scraped_payload["link"] = normalized_url
+                            scraped_payload = backend.analyze_and_extract_url(manual_info["normalized_url"])
+                            scraped_payload = backend.evaluate_payload(
+                                scraped_payload,
+                                good_keywords=good_kw_list,
+                                bad_keywords=bad_kw_list,
+                            )
+                        scraped_payload["link"] = manual_info["normalized_url"]
                         st.session_state["current_payload"] = scraped_payload
                         st.session_state["show_editor"] = True
                         st.session_state["manual_domain_exists"] = False
@@ -133,6 +141,11 @@ if check_password():
                 else:
                     with st.spinner("Analyzing and parsing remote server contents..."):
                         scraped_payload = backend.analyze_and_extract_url(analysis_url)
+                        scraped_payload = backend.evaluate_payload(
+                            scraped_payload,
+                            good_keywords=good_kw_list,
+                            bad_keywords=bad_kw_list,
+                        )
                         scraped_payload["link"] = analysis_url
                         st.session_state["current_payload"] = scraped_payload
                         st.session_state["show_editor"] = True
@@ -152,6 +165,11 @@ if check_password():
                 if existing_choice == "Reanalyze and update":
                     with st.spinner("Reanalyzing existing domain..."):
                         scraped_payload = backend.analyze_and_extract_url(st.session_state.get("manual_pending_url"))
+                        scraped_payload = backend.evaluate_payload(
+                            scraped_payload,
+                            good_keywords=good_kw_list,
+                            bad_keywords=bad_kw_list,
+                        )
                         scraped_payload["link"] = st.session_state.get("manual_pending_url")
                         st.session_state["current_payload"] = scraped_payload
                         st.session_state["show_editor"] = True
@@ -392,13 +410,34 @@ if check_password():
             with col2:
                 limit = st.selectbox("Max Results:", options=[100, 50, 10], index=0)
 
+            st.divider()
+
             col3, col4 = st.columns(2)
             with col3:
                 include_inurl = st.checkbox("Include 'inurl' in the search", value=False)
-            with col4:
                 homepage_only = st.checkbox("Include only homepage results", value=False)
+            with col4:
+                site_domain = st.text_input("Search within a domain", placeholder="chabad.org")
+                
+            st.divider()
+
+            date_restrict = st.checkbox(
+                    "Restrict results by date range",
+                    value=False,
+                    help="Date filters are visible always, but applied only when this checkbox is checked.",
+                )
+            
+            date_col1, date_col2 = st.columns(2)
+            with date_col1:
+                date_from = st.date_input("From date", value=datetime.date.today(), key="search_from_date")
+            with date_col2:
+                date_to = st.date_input("To date", value=datetime.date.today(), key="search_to_date")
 
             run_search = st.form_submit_button("Run Keyword Search")
+
+        if not date_restrict:
+            date_from = None
+            date_to = None
 
         if run_search:
             clear_processed_review_state()
@@ -407,105 +446,22 @@ if check_password():
                 st.warning("Please provide keywords to search for.")
             else:
                 keywords = [k.strip() for k in keywords_query.split(",") if k.strip()]
-                all_links = []  
-
-                for kw in keywords:
-                    # 'inurl' option implementation
-                    q = f"inurl:{kw}" if include_inurl else kw
-                    try:
-                        links = backend.google_search(q, num_results=limit, language=language)
-                    except Exception as e:
-                        st.error(f"Search failed for '{kw}': {e}")
-                        links = []
-                    all_links.extend([(l, kw) for l in links])
-
-                domain_to_keyword = {}
-                root_urls = []
-                seen = set()
-                domain_to_original_link = {}
-
-                for link, kw in all_links:
-                    raw = link
-                    if not raw:
-                        continue
-                    if not raw.startswith("http://") and not raw.startswith("https://"):
-                        raw = "http://" + raw
-
-                    p = urlparse(raw)
-                    netloc = (p.netloc or "").lower()
-                    if not netloc:
-                        continue
-
-                    domain_key = netloc[4:] if netloc.startswith("www.") else netloc
-                    domain_root = f"{p.scheme}://{p.netloc}"
-
-                    # 'homepage_only' filtering implementation
-                    if homepage_only:
-                        path_clean = p.path.strip("/")
-                        # If a path query or fragment parameters exist, reject this non-homepage branch result
-                        if path_clean or p.query or p.fragment:
-                            continue
-
-                    if domain_key in seen:
-                        continue
-
-                    try:
-                        if backend.domain_exists(domain_key):
-                            continue
-                    except Exception:
-                        pass
-
-                    seen.add(domain_key)
-                    root_urls.append(domain_root)
-                    domain_to_keyword[domain_root] = kw
-                    domain_to_original_link[domain_root] = raw
-
-                unique_links = root_urls
-                st.success(f"Collected {len(unique_links)} unique domain roots from search results.")
-
                 try:
-                    kw_rows = backend.get_all_keywords() or []
-                    good_kw_list = [r["word"] for r in kw_rows if r.get("good")]
-                    bad_kw_list = [r["word"] for r in kw_rows if r.get("good") is False]
-                except Exception:
-                    good_kw_list = []
-                    bad_kw_list = []
+                    processed = backend.search_google_keywords(
+                        keywords,
+                        language=language,
+                        limit=limit,
+                        include_inurl=include_inurl,
+                        homepage_only=homepage_only,
+                        site_domain=site_domain.strip() if site_domain else None,
+                        date_from=date_from.isoformat() if date_from else None,
+                        date_to=date_to.isoformat() if date_to else None,
+                    )
+                except Exception as e:
+                    st.error(f"Search failed: {e}")
+                    processed = []
 
-                processed = []
-
-                for link in unique_links:
-                    originating_kw = domain_to_keyword.get(link)
-                    original_full_url = domain_to_original_link.get(link, link)
-
-                    try:
-                        payload = backend.analyze_and_extract_url(link)
-                    except Exception as e:
-                        st.error(f"Failed to analyze {link}: {e}")
-                        continue
-
-                    payload["link"] = original_full_url
-                    if originating_kw:
-                        payload["source"] = f"Google search for {originating_kw}"
-
-                    text_fields = " ".join([str(payload.get(k) or "") for k in ("title", "description", "title_english", "description_english")]).lower()
-                    good_matches = sum(1 for kw in good_kw_list if kw.lower() in text_fields)
-                    bad_matches = sum(1 for kw in bad_kw_list if kw.lower() in text_fields)
-
-                    if good_matches >= 1 and bad_matches >= 1:
-                        payload["status"] = "Not sure"
-                        payload["status_details"] = f"{good_matches} good keywords and {bad_matches} bad keywords"
-                    elif bad_matches >= 1:
-                        payload["status"] = "Not relevant"
-                        payload["status_details"] = f"{bad_matches} bad keyword{'s' if bad_matches != 1 else ''} matched"
-                    elif good_matches >= 1:
-                        payload["status"] = "Approved"
-                        payload["status_details"] = f"{good_matches} good keyword{'s' if good_matches != 1 else ''} matched"
-                    else:
-                        payload["status"] = "Not sure"
-                        payload["status_details"] = "0 good keywords and 0 bad keywords"
-
-                    processed.append(payload)
-
+                st.success(f"Collected {len(processed)} unique domain roots from search results.")
                 st.session_state["ordered_processed"] = (
                     [p for p in processed if p.get("status") != "Approved"]
                     + [p for p in processed if p.get("status") == "Approved"]

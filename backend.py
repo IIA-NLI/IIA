@@ -186,6 +186,31 @@ class ArchiveBackend:
         trimmed_url = f"{parsed.scheme}://{parsed.netloc}"
         return normalized_url, domain_key, has_extra_path, trimmed_url
 
+    def _normalize_site_domain(self, site_domain: str) -> str:
+        """Normalize a site domain value for use inside search queries."""
+        trimmed = site_domain.strip()
+        if not trimmed:
+            return ""
+        if trimmed.startswith("http://") or trimmed.startswith("https://"):
+            parsed = urlparse(trimmed)
+            normalized = parsed.netloc or trimmed
+        else:
+            normalized = trimmed
+        if normalized.startswith("www."):
+            normalized = normalized[4:]
+        return normalized
+
+    def prepare_manual_url(self, url: str) -> dict:
+        """Normalize a manual URL and inspect whether its domain already exists."""
+        normalized_url, domain_key, has_extra_path, trimmed_url = self.normalize_manual_url(url)
+        return {
+            "normalized_url": normalized_url,
+            "domain_key": domain_key,
+            "has_extra_path": has_extra_path,
+            "trimmed_url": trimmed_url,
+            "domain_exists": self.domain_exists(domain_key),
+        }
+
     # Language mapping helpers
     def _lang_code_to_name(self, code: str) -> str:
         if not code:
@@ -248,10 +273,36 @@ class ArchiveBackend:
         }
         return rev.get(n, "en")
 
-    def google_search(self, query: str, num_results: int = 100, language: str = "en") -> list:
-        """Fetch up to `num_results` results from Google CSE."""
+    def google_search(
+        self,
+        query: str,
+        num_results: int = 100,
+        language: str = "en",
+        site_domain: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+    ) -> list:
+        """Fetch up to `num_results` results from Google CSE with optional site/date filters."""
         api_key = st.secrets.get("cse_key")
         cse_id = st.secrets.get("cse_id")
+
+        if site_domain:
+            normalized_site = self._normalize_site_domain(site_domain)
+            if normalized_site:
+                query = f"site:{normalized_site} {query}"
+
+        if date_from:
+            query = f"{query} after:{date_from}"
+        if date_to:
+            query = f"{query} before:{date_to}"
+
+        if not language:
+            language_code = "en"
+        else:
+            if len(language) > 2 and not ("-" in language and len(language) <= 5):
+                language_code = self._lang_name_to_code(language)
+            else:
+                language_code = language
 
         if not language:
             language_code = "en"
@@ -311,8 +362,10 @@ class ArchiveBackend:
 
         return all_results
 
-    def evaluate_payload(self, payload: dict, good_keywords: list | None = None) -> dict:
+    def evaluate_payload(self, payload: dict, good_keywords: list | None = None, bad_keywords: list | None = None) -> dict:
         """Apply auto-evaluation rules to a scraped payload and set status/status_details."""
+        good_keywords = good_keywords or []
+        bad_keywords = bad_keywords or []
         approved = False
 
         url = payload.get("url") or ""
@@ -326,34 +379,124 @@ class ArchiveBackend:
             language_items = list(languages.keys())
         else:
             language_items = languages
-        if any("hebrew" in str(l).lower() for l in language_items):
+        hebrew_detected = any("hebrew" in str(l).lower() for l in language_items)
+        if hebrew_detected:
             approved = True
 
-        if good_keywords:
-            text_fields = " ".join([str(payload.get(k) or "") for k in ("title", "description", "title_english", "description_english")]).lower()
-            for kw in good_keywords:
-                if kw.lower() in text_fields:
-                    approved = True
-                    break
-
-        kw_count = 0
-        if good_keywords:
-            text_fields = " ".join([str(payload.get(k) or "") for k in ("title", "description", "title_english", "description_english")]).lower()
-            for kw in good_keywords:
-                if kw.lower() in text_fields:
-                    kw_count += 1
+        normalized_text = " ".join([str(payload.get(k) or "") for k in ("title", "description", "title_english", "description_english")]).lower()
+        good_matches = self._count_keyword_matches(normalized_text, good_keywords)
+        bad_matches = self._count_keyword_matches(normalized_text, bad_keywords)
 
         if hostname.endswith(".il"):
             payload["status_details"] = ".il suffix"
-        elif any("hebrew" in str(l).lower() for l in language_items):
+        elif hebrew_detected:
             payload["status_details"] = "Hebrew"
-        elif kw_count > 0:
-            payload["status_details"] = f"Found {kw_count} good keywords"
+        elif bad_matches > 0 and good_matches > 0:
+            payload["status_details"] = f"{good_matches} good keywords and {bad_matches} bad keywords"
+        elif bad_matches > 0:
+            payload["status_details"] = f"{bad_matches} bad keyword{'s' if bad_matches != 1 else ''} matched"
+        elif good_matches > 0:
+            payload["status_details"] = f"{good_matches} good keyword{'s' if good_matches != 1 else ''} matched"
         else:
             payload["status_details"] = "Determined by user"
 
-        payload["status"] = "Approved" if approved else "Not sure"
+        if bad_matches > 0 and not (hostname.endswith(".il") or hebrew_detected):
+            if good_matches > 0:
+                payload["status"] = "Not sure"
+            else:
+                payload["status"] = "Not relevant"
+        else:
+            payload["status"] = "Approved" if (hostname.endswith(".il") or hebrew_detected or good_matches > 0) else "Not sure"
+
+        payload["matched_good_keywords"] = [kw for kw in good_keywords if kw.lower() in normalized_text]
+        payload["matched_bad_keywords"] = [kw for kw in bad_keywords if kw.lower() in normalized_text]
         return payload
+
+    def _count_keyword_matches(self, text: str, keywords: list) -> int:
+        return sum(1 for kw in keywords if kw and kw.lower() in text)
+
+    def get_keyword_lists(self) -> tuple[list, list]:
+        """Return ordered good and bad keyword lists from the KEYWORDS table."""
+        rows = self.get_all_keywords() or []
+        good = [r["word"] for r in rows if r.get("good")]
+        bad = [r["word"] for r in rows if r.get("good") is False]
+        return good, bad
+
+    def search_google_keywords(
+        self,
+        keywords: list,
+        language: str = "en",
+        limit: int = 100,
+        include_inurl: bool = False,
+        homepage_only: bool = False,
+        site_domain: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+    ) -> list:
+        """Run Google search for keyword list and return normalized, analyzed payloads for review."""
+        all_links = []
+        for kw in keywords:
+            query = f"inurl:{kw}" if include_inurl else kw
+            try:
+                links = self.google_search(
+                    query,
+                    num_results=limit,
+                    language=language,
+                    site_domain=site_domain,
+                    date_from=date_from,
+                    date_to=date_to,
+                )
+            except Exception:
+                links = []
+            all_links.extend([(l, kw) for l in links])
+
+        seen_domain_keys = set()
+        root_urls = []
+        domain_to_keyword = {}
+        domain_to_original_link = {}
+
+        for link, kw in all_links:
+            raw = link
+            if not raw:
+                continue
+            if not raw.startswith("http://") and not raw.startswith("https://"):
+                raw = "http://" + raw
+
+            parsed = urlparse(raw)
+            netloc = (parsed.netloc or "").lower()
+            if not netloc:
+                continue
+
+            domain_key = netloc[4:] if netloc.startswith("www.") else netloc
+            domain_root = f"{parsed.scheme}://{parsed.netloc}"
+
+            if homepage_only:
+                path_clean = parsed.path.strip("/")
+                if path_clean or parsed.query or parsed.fragment:
+                    continue
+
+            if domain_key in seen_domain_keys:
+                continue
+
+            if self.domain_exists(domain_key):
+                continue
+
+            seen_domain_keys.add(domain_key)
+            root_urls.append(domain_root)
+            domain_to_keyword[domain_root] = kw
+            domain_to_original_link[domain_root] = raw
+
+        good_keywords, bad_keywords = self.get_keyword_lists()
+        processed = []
+        for link in root_urls:
+            payload = self.analyze_and_extract_url(link)
+            payload["link"] = domain_to_original_link.get(link, link)
+            if domain_to_keyword.get(link):
+                payload["source"] = f"Google search for {domain_to_keyword[link]}"
+            payload = self.evaluate_payload(payload, good_keywords=good_keywords, bad_keywords=bad_keywords)
+            processed.append(payload)
+
+        return processed
 
     def domain_exists(self, domain_url: str) -> bool:
         """Check whether a domain already exists in `DOMAINS`."""
@@ -382,6 +525,26 @@ class ArchiveBackend:
         except Exception:
             return False
 
+    def _sanitize_domain_payload(self, payload: dict) -> dict:
+        """Keep only allowed DOMAINS fields and drop internal evaluation keys."""
+        allowed = {
+            "url",
+            "title",
+            "description",
+            "title_english",
+            "description_english",
+            "languages",
+            "status",
+            "status_details",
+            "response_code",
+            "source",
+            "created_at",
+            "updated_at",
+            "id",
+        }
+        sanitized = {k: v for k, v in payload.items() if k in allowed}
+        return sanitized
+
     def insert_domain(self, payload: dict):
         """Upserts processed metadata into the DOMAINS table using strictly Jerusalem time."""
         now_iso = self._now_jerusalem_iso()
@@ -389,9 +552,10 @@ class ArchiveBackend:
             payload["created_at"] = now_iso
         payload["updated_at"] = now_iso
 
+        sanitized = self._sanitize_domain_payload(payload)
         return (
             self.supabase.table("DOMAINS")
-            .upsert(payload, on_conflict="url")
+            .upsert(sanitized, on_conflict="url")
             .execute()
         )
 
