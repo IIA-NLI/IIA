@@ -391,14 +391,10 @@ class ArchiveBackend:
             payload["status_details"] = ".il suffix"
         elif hebrew_detected:
             payload["status_details"] = "Hebrew"
-        elif bad_matches > 0 and good_matches > 0:
-            payload["status_details"] = f"{good_matches} good keywords and {bad_matches} bad keywords"
-        elif bad_matches > 0:
-            payload["status_details"] = f"{bad_matches} bad keyword{'s' if bad_matches != 1 else ''} matched"
         elif good_matches > 0:
             payload["status_details"] = f"{good_matches} good keyword{'s' if good_matches != 1 else ''} matched"
         else:
-            payload["status_details"] = "Determined by user"
+            payload["status_details"] = ""
 
         if bad_matches > 0 and not (hostname.endswith(".il") or hebrew_detected):
             if good_matches > 0:

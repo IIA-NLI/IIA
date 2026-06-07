@@ -194,12 +194,14 @@ if check_password():
                     st.metric(label="Server Response Code", value=payload["response_code"] or "N/A")
                     
                     status_options = ["Approved", "Not sure", "Not relevant"]
-                    default_status_idx = status_options.index(payload["status"]) if payload["status"] in status_options else 0
-                    edited_status = st.selectbox("Status Evaluation", options=status_options, index=default_status_idx)
-                    edited_status_details = st.text_input("Status Details", value="Manually added")
+                    edited_status = st.selectbox("Status Evaluation", options=status_options, index=0)
+                    edited_status_details = st.text_input(
+                        "Status Details",
+                        value=payload.get("status_details", "") or "",
+                    )
 
-                    st.text_input("Extracted Title", value=payload["title"] or "", disabled=True)
-                    st.text_area("Extracted Description", value=payload["description"] or "", disabled=True)
+                    edited_title = st.text_input("Extracted Title", value=payload["title"] or "")
+                    edited_description = st.text_area("Extracted Description", value=payload["description"] or "")
 
                 with col2:
                     languages_data = payload.get("languages")
@@ -214,13 +216,28 @@ if check_password():
                     st.text_input("English Title Translation", value=payload["title_english"] or "", disabled=True)
                     st.text_area("English Description Translation", value=payload["description_english"] or "", disabled=True)
 
+                matched_good = payload.get("matched_good_keywords") or []
+                matched_bad = payload.get("matched_bad_keywords") or []
+                if matched_good or matched_bad:
+                    st.markdown("**Matched Keywords**")
+                    if matched_good:
+                        st.success(f"Good keywords matched: {', '.join(matched_good)}")
+                    else:
+                        st.info("No good keywords matched.")
+                    if matched_bad:
+                        st.warning(f"Bad keywords matched: {', '.join(matched_bad)}")
+                    else:
+                        st.info("No bad keywords matched.")
+
                 submit_to_db = st.form_submit_button("Save and Commit to Archive")
 
                 if submit_to_db:
                     cleaned_langs = [l.strip() for l in edited_langs_str.split(",") if l.strip()]
 
                     payload["status"] = edited_status
-                    payload["status_details"] = edited_status_details
+                    payload["status_details"] = edited_status_details if edited_status == "Approved" else ""
+                    payload["title"] = edited_title or None
+                    payload["description"] = edited_description or None
                     payload["languages"] = cleaned_langs if cleaned_langs else None
 
                     payload.pop("link", None)
@@ -418,7 +435,7 @@ if check_password():
                 homepage_only = st.checkbox("Include only homepage results", value=False)
             with col4:
                 site_domain = st.text_input("Search within a domain", placeholder="chabad.org")
-                
+
             st.divider()
 
             date_restrict = st.checkbox(
