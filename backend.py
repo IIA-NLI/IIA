@@ -361,51 +361,59 @@ class ArchiveBackend:
                 pass
 
         return all_results
-
+    
     def evaluate_payload(self, payload: dict, good_keywords: list | None = None, bad_keywords: list | None = None) -> dict:
         """Apply auto-evaluation rules to a scraped payload and set status/status_details."""
         good_keywords = good_keywords or []
         bad_keywords = bad_keywords or []
-        approved = False
 
+        # 1. IL
         url = payload.get("url") or ""
         parsed = urlparse(url)
         hostname = (parsed.hostname or "").lower()
-        if hostname.endswith(".il"):
-            approved = True
-
-        languages = payload.get("languages") or []
-        if isinstance(languages, dict):
-            language_items = list(languages.keys())
-        else:
-            language_items = languages
-        hebrew_detected = any("hebrew" in str(l).lower() for l in language_items)
-        if hebrew_detected:
-            approved = True
-
-        normalized_text = " ".join([str(payload.get(k) or "") for k in ("title", "description", "title_english", "description_english")]).lower()
-        good_matches = self._count_keyword_matches(normalized_text, good_keywords)
-        bad_matches = self._count_keyword_matches(normalized_text, bad_keywords)
 
         if hostname.endswith(".il"):
+            payload["status"] = "Approved"
             payload["status_details"] = ".il suffix"
-        elif hebrew_detected:
-            payload["status_details"] = "Hebrew"
-        elif good_matches > 0:
-            payload["status_details"] = f"{good_matches} good keyword{'s' if good_matches != 1 else ''} matched"
-        else:
-            payload["status_details"] = ""
 
-        if bad_matches > 0 and not (hostname.endswith(".il") or hebrew_detected):
-            if good_matches > 0:
-                payload["status"] = "Not sure"
+        else:
+            # 2. Hebrew
+            languages = payload.get("languages") or []
+            if isinstance(languages, dict):
+                language_items = list(languages.keys())
             else:
-                payload["status"] = "Not relevant"
-        else:
-            payload["status"] = "Approved" if (hostname.endswith(".il") or hebrew_detected or good_matches > 0) else "Not sure"
+                language_items = languages
+            hebrew_detected = any("hebrew" in str(l).lower() for l in language_items)
 
-        payload["matched_good_keywords"] = [kw for kw in good_keywords if kw.lower() in normalized_text]
-        payload["matched_bad_keywords"] = [kw for kw in bad_keywords if kw.lower() in normalized_text]
+            if hebrew_detected:
+                payload["status"] = "Approved"
+                payload["status_details"] = "Hebrew"
+
+            else:
+                # 3. Keywords 
+                normalized_text = " ".join([str(payload.get(k) or "") for k in ("title", "description", "title_english", "description_english")]).lower()
+                good_matches = self._count_keyword_matches(normalized_text, good_keywords)
+                bad_matches = self._count_keyword_matches(normalized_text, bad_keywords)
+
+                if good_matches > 0 and bad_matches > 0:
+                    payload["status"] = "Not sure"
+                    payload["status_details"] = f"{good_matches} good keyword{'s' if good_matches != 1 else ''} matched"
+                elif good_matches > 0:
+                    payload["status"] = "Approved"
+                    payload["status_details"] = f"{good_matches} good keyword{'s' if good_matches != 1 else ''} matched"
+                elif bad_matches > 0:
+                    payload["status"] = "Not relevant"
+                    payload["status_details"] = ""
+                else:
+                    payload["status"] = "Not sure"
+                    payload["status_details"] = ""
+
+                payload["matched_good_keywords"] = [kw for kw in good_keywords if kw.lower() in normalized_text]
+                payload["matched_bad_keywords"] = [kw for kw in bad_keywords if kw.lower() in normalized_text]
+                return payload
+
+        payload["matched_good_keywords"] = []
+        payload["matched_bad_keywords"] = []
         return payload
 
     def _count_keyword_matches(self, text: str, keywords: list) -> int:
