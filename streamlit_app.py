@@ -74,44 +74,92 @@ if check_password():
         good_kw_list, bad_kw_list = backend.get_keyword_lists()
 
         with st.form("url_fetch_form"):
-            input_url = st.text_input("Target URL", placeholder="example.co.il")
+            input_url = st.text_area(
+                "Target URL(s)",
+                placeholder="example.co.il\nexample.org\nhttps://sub.example.com/path",
+                help="Enter one URL per line or comma-separated. URLs containing paths will be normalized to their root domain when needed.",
+            )
             fetch_btn = st.form_submit_button("Analyze Domain")
 
         if fetch_btn:
-            # Explicit input verification: Check format, whitespace, or illegal chars
-            if not input_url:
-                st.warning("Please specify a valid URL path first.")
-            elif not backend.is_valid_url_format(input_url):
-                st.error("❌ Invalid URL structure! Spaces or special characters are forbidden.")
+            urls = [u.strip() for u in re.split(r"[\n,]+", input_url) if u.strip()]
+            if not urls:
+                st.warning("Please specify at least one URL first.")
             else:
-                manual_info = backend.prepare_manual_url(input_url)
+                invalid_urls = [u for u in urls if not backend.is_valid_url_format(u)]
+                if invalid_urls:
+                    st.error(
+                        "❌ Invalid URL structure found. Please remove or fix the following entries: "
+                        + ", ".join(invalid_urls)
+                    )
 
-                if manual_info["has_extra_path"]:
-                    st.session_state["manual_original_url"] = manual_info["normalized_url"]
-                    st.session_state["manual_trimmed_url"] = manual_info["trimmed_url"]
-                    st.session_state["manual_pending_domain"] = manual_info["domain_key"]
-                    st.session_state["manual_url_needs_choice"] = True
-                    st.session_state["manual_domain_exists"] = False
+                valid_urls = [u for u in urls if backend.is_valid_url_format(u)]
+                if not valid_urls:
                     st.session_state["show_editor"] = False
-                else:
-                    st.session_state["manual_url_needs_choice"] = False
-                    st.session_state["manual_pending_url"] = manual_info["normalized_url"]
-                    st.session_state["manual_pending_domain"] = manual_info["domain_key"]
-                    if manual_info["domain_exists"]:
-                        st.session_state["manual_domain_exists"] = True
+                elif len(valid_urls) == 1:
+                    input_url = valid_urls[0]
+                    manual_info = backend.prepare_manual_url(input_url)
+
+                    if manual_info["has_extra_path"]:
+                        st.session_state["manual_original_url"] = manual_info["normalized_url"]
+                        st.session_state["manual_trimmed_url"] = manual_info["trimmed_url"]
+                        st.session_state["manual_pending_domain"] = manual_info["domain_key"]
+                        st.session_state["manual_url_needs_choice"] = True
+                        st.session_state["manual_domain_exists"] = False
                         st.session_state["show_editor"] = False
                     else:
-                        with st.spinner("Analyzing and parsing remote server contents..."):
-                            scraped_payload = backend.analyze_and_extract_url(manual_info["normalized_url"])
+                        st.session_state["manual_url_needs_choice"] = False
+                        st.session_state["manual_pending_url"] = manual_info["normalized_url"]
+                        st.session_state["manual_pending_domain"] = manual_info["domain_key"]
+                        if manual_info["domain_exists"]:
+                            st.session_state["manual_domain_exists"] = True
+                            st.session_state["show_editor"] = False
+                        else:
+                            with st.spinner("Analyzing and parsing remote server contents..."):
+                                scraped_payload = backend.analyze_and_extract_url(manual_info["normalized_url"])
+                                scraped_payload = backend.evaluate_payload(
+                                    scraped_payload,
+                                    good_keywords=good_kw_list,
+                                    bad_keywords=bad_kw_list,
+                                )
+                            scraped_payload["status"] = "Approved"
+                            scraped_payload["link"] = manual_info["normalized_url"]
+                            st.session_state["manual_payloads"] = [scraped_payload]
+                            st.session_state["show_editor"] = True
+                            st.session_state["manual_domain_exists"] = False
+                else:
+                    batch_payloads = []
+                    skipped_existing = []
+                    with st.spinner("Analyzing and parsing remote server contents..."):
+                        for url in valid_urls:
+                            manual_info = backend.prepare_manual_url(url)
+                            if manual_info["domain_exists"]:
+                                skipped_existing.append(manual_info["normalized_url"])
+                                continue
+
+                            analysis_url = manual_info["trimmed_url"] if manual_info["has_extra_path"] else manual_info["normalized_url"]
+                            scraped_payload = backend.analyze_and_extract_url(analysis_url)
                             scraped_payload = backend.evaluate_payload(
                                 scraped_payload,
                                 good_keywords=good_kw_list,
                                 bad_keywords=bad_kw_list,
                             )
-                        scraped_payload["link"] = manual_info["normalized_url"]
-                        st.session_state["current_payload"] = scraped_payload
+                            scraped_payload["status"] = "Approved"
+                            scraped_payload["link"] = analysis_url
+                            scraped_payload["original_input"] = url
+                            batch_payloads.append(scraped_payload)
+
+                    if skipped_existing:
+                        st.info(
+                            "The following domains were already present and were skipped: "
+                            + ", ".join(skipped_existing)
+                        )
+
+                    if batch_payloads:
+                        st.session_state["manual_payloads"] = batch_payloads
                         st.session_state["show_editor"] = True
-                        st.session_state["manual_domain_exists"] = False
+                    else:
+                        st.session_state["show_editor"] = False
 
         if st.session_state.get("manual_url_needs_choice"):
             st.warning(
@@ -180,73 +228,130 @@ if check_password():
                 st.session_state["manual_domain_exists"] = False
 
         if st.session_state.get("show_editor"):
-            payload = st.session_state["current_payload"]
-            chosen_url = st.session_state.get("manual_pending_url", payload.get("url"))
+            payloads = st.session_state.get("manual_payloads", [])
+            if not payloads and st.session_state.get("current_payload"):
+                payloads = [st.session_state.get("current_payload")]
 
-            st.write("---")
-            st.subheader("🔍 Review and Edit Extracted Metadata")
-            st.markdown(f"**URL:** {payload.get('link', chosen_url)}")
+            if payloads:
+                st.write("---")
+                st.subheader("🔍 Review and Edit Extracted Metadata")
+                if len(payloads) > 1:
+                    st.info("Review each URL result below before committing the batch to the archive.")
 
-            with st.form("metadata_edit_form"):
-                col1, col2 = st.columns(2)
-
-                with col1:
-                    st.metric(label="Server Response Code", value=payload["response_code"] or "N/A")
-                    
-                    status_options = ["Approved", "Not sure", "Not relevant"]
-                    edited_status = st.selectbox("Status Evaluation", options=status_options, index=0)
-                    edited_status_details = st.text_input(
-                        "Status Details",
-                        value=payload.get("status_details", "") or "",
+                with st.form("metadata_edit_form"):
+                    st.subheader("Batch Settings")
+                    global_source = st.text_input(
+                        "Source (applies to all URLs)",
+                        value="manually",
+                        help="Enter the source for all URLs in this batch",
                     )
 
-                    edited_title = st.text_input("Extracted Title", value=payload["title"] or "")
-                    edited_description = st.text_area("Extracted Description", value=payload["description"] or "")
+                    for idx, payload in enumerate(payloads):
+                        chosen_url = st.session_state.get("manual_pending_url", payload.get("url"))
+                        url_label = payload.get("link", chosen_url)
+                        with st.expander(f"Item {idx + 1}: {url_label}", expanded=True):
+                            st.markdown(f"**URL:** {url_label}")
+                            col1, col2 = st.columns(2)
 
-                with col2:
-                    languages_data = payload.get("languages")
-                    detected_langs_list = []
-                    if isinstance(languages_data, list):
-                        detected_langs_list = languages_data
-                    elif isinstance(languages_data, dict):
-                        detected_langs_list = list(languages_data.keys())
+                            with col1:
+                                st.metric(label="Server Response Code", value=payload["response_code"] or "N/A")
+                                status_options = ["Approved", "Not sure", "Not relevant"]
+                                edited_status = st.selectbox(
+                                    "Status Evaluation",
+                                    options=status_options,
+                                    index=0,
+                                    key=f"status_{idx}",
+                                )
+                                edited_status_details = st.text_input(
+                                    "Status Details",
+                                    value=payload.get("status_details", "") or "",
+                                    key=f"details_{idx}",
+                                )
+                                edited_title = st.text_input(
+                                    "Extracted Title",
+                                    value=payload.get("title") or "",
+                                    key=f"title_{idx}",
+                                )
+                                edited_description = st.text_area(
+                                    "Extracted Description",
+                                    value=payload.get("description") or "",
+                                    key=f"description_{idx}",
+                                )
 
-                    edited_langs_str = st.text_input("Languages List (comma-separated)", value=", ".join(detected_langs_list))
+                            with col2:
+                                languages_data = payload.get("languages")
+                                detected_langs_list = []
+                                if isinstance(languages_data, list):
+                                    detected_langs_list = languages_data
+                                elif isinstance(languages_data, dict):
+                                    detected_langs_list = list(languages_data.keys())
 
-                    st.text_input("English Title Translation", value=payload["title_english"] or "", disabled=True)
-                    st.text_area("English Description Translation", value=payload["description_english"] or "", disabled=True)
+                                edited_langs_str = st.text_input(
+                                    "Languages List (comma-separated)",
+                                    value=", ".join(detected_langs_list),
+                                    key=f"langs_{idx}",
+                                )
+                                st.text_input(
+                                    "English Title Translation",
+                                    value=payload.get("title_english") or "",
+                                    disabled=True,
+                                    key=f"title_en_{idx}",
+                                )
+                                st.text_area(
+                                    "English Description Translation",
+                                    value=payload.get("description_english") or "",
+                                    disabled=True,
+                                    key=f"description_en_{idx}",
+                                )
 
-                matched_good = payload.get("matched_good_keywords") or []
-                matched_bad = payload.get("matched_bad_keywords") or []
-                if matched_good or matched_bad:
-                    st.markdown("**Matched Keywords**")
-                    if matched_good:
-                        st.success(f"Good keywords matched: {', '.join(matched_good)}")
-                    else:
-                        st.info("No good keywords matched.")
-                    if matched_bad:
-                        st.warning(f"Bad keywords matched: {', '.join(matched_bad)}")
-                    else:
-                        st.info("No bad keywords matched.")
+                            matched_good = payload.get("matched_good_keywords") or []
+                            matched_bad = payload.get("matched_bad_keywords") or []
+                            if matched_good or matched_bad:
+                                st.markdown("**Matched Keywords**")
+                                if matched_good:
+                                    st.success(f"Good keywords matched: {', '.join(matched_good)}")
+                                else:
+                                    st.info("No good keywords matched.")
+                                if matched_bad:
+                                    st.warning(f"Bad keywords matched: {', '.join(matched_bad)}")
+                                else:
+                                    st.info("No bad keywords matched.")
 
-                submit_to_db = st.form_submit_button("Save and Commit to Archive")
+                    submit_to_db = st.form_submit_button("Save and Commit to Archive")
 
-                if submit_to_db:
-                    cleaned_langs = [l.strip() for l in edited_langs_str.split(",") if l.strip()]
+                    if submit_to_db:
+                        committed = []
+                        failed = []
+                        for idx, payload in enumerate(payloads):
+                            edited_status = st.session_state.get(f"status_{idx}", "Approved")
+                            edited_status_details = st.session_state.get(f"details_{idx}", payload.get("status_details", ""))
+                            edited_title = st.session_state.get(f"title_{idx}", payload.get("title") or "")
+                            edited_description = st.session_state.get(f"description_{idx}", payload.get("description") or "")
+                            edited_langs_str = st.session_state.get(f"langs_{idx}", "")
+                            cleaned_langs = [l.strip() for l in edited_langs_str.split(",") if l.strip()]
 
-                    payload["status"] = edited_status
-                    payload["status_details"] = edited_status_details if edited_status == "Approved" else ""
-                    payload["title"] = edited_title or None
-                    payload["description"] = edited_description or None
-                    payload["languages"] = cleaned_langs if cleaned_langs else None
+                            payload["status"] = edited_status
+                            payload["status_details"] = edited_status_details if edited_status == "Approved" else ""
+                            payload["title"] = edited_title or None
+                            payload["description"] = edited_description or None
+                            payload["languages"] = cleaned_langs if cleaned_langs else None
+                            payload["source"] = global_source
+                            payload.pop("link", None)
+                            payload.pop("original_input", None)
 
-                    payload.pop("link", None)
-                    try:
-                        backend.insert_domain(payload)
-                        st.success(f"Successfully registered **{payload['url']}** to the Database!")
-                        st.session_state["show_editor"] = False
-                    except Exception as db_err:
-                        st.error(f"Database sync failed: {db_err}")
+                            try:
+                                backend.insert_domain(payload)
+                                committed.append(payload["url"])
+                            except Exception as db_err:
+                                failed.append((payload.get("url"), str(db_err)))
+
+                        if committed:
+                            st.success(f"Successfully registered {len(committed)} URL(s) to the Database!")
+                            st.session_state["show_editor"] = False
+                            st.session_state.pop("manual_payloads", None)
+                        if failed:
+                            for failed_url, err in failed:
+                                st.error(f"Failed to save {failed_url}: {err}")
 
     # --- VIEW 2: CENTRAL URL EXPLORER ENGINE ---
     elif option == "🌐 Domains Database Explorer":
@@ -446,9 +551,21 @@ if check_password():
             
             date_col1, date_col2 = st.columns(2)
             with date_col1:
-                date_from = st.date_input("From date", value=datetime.date.today(), key="search_from_date")
+                date_from = st.date_input(
+                    "From date",
+                    value=datetime.date(1995, 1, 1),
+                    min_value=datetime.date(1995, 1, 1),
+                    max_value=datetime.date.today(),
+                    key="search_from_date",
+                )
             with date_col2:
-                date_to = st.date_input("To date", value=datetime.date.today(), key="search_to_date")
+                date_to = st.date_input(
+                    "To date",
+                    value=datetime.date.today(),
+                    min_value=datetime.date(1995, 1, 1),
+                    max_value=datetime.date.today(),
+                    key="search_to_date",
+                )
 
             run_search = st.form_submit_button("Run Keyword Search")
 
