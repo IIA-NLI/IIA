@@ -397,7 +397,7 @@ class ArchiveBackend:
 
                 if good_matches > 0 and bad_matches > 0:
                     payload["status"] = "Not sure"
-                    payload["status_details"] = f"{good_matches} good keyword{'s' if good_matches != 1 else ''} matched"
+                    payload["status_details"] = f"{good_matches} good keyword{'s' if good_matches != 1 else ''} and {bad_matches} bad keyoword{'s' if good_matches != 1 else ''} matched"
                 elif good_matches > 0:
                     payload["status"] = "Approved"
                     payload["status_details"] = f"{good_matches} good keyword{'s' if good_matches != 1 else ''} matched"
