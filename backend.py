@@ -417,7 +417,11 @@ class ArchiveBackend:
         return payload
 
     def _count_keyword_matches(self, text: str, keywords: list) -> int:
-        return sum(1 for kw in keywords if kw and kw.lower() in text)
+        text = text.lower()
+        return sum(
+            1 for kw in keywords
+            if kw and re.search(rf"\b{re.escape(kw.lower())}\b", text)
+        )
 
     def get_keyword_lists(self) -> tuple[list, list]:
         """Return ordered good and bad keyword lists from the KEYWORDS table."""
