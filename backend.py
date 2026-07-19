@@ -397,7 +397,7 @@ class ArchiveBackend:
 
                 if good_matches > 0 and bad_matches > 0:
                     payload["status"] = "Not sure"
-                    payload["status_details"] = f"{good_matches} good keyword{'s' if good_matches != 1 else ''} matched"
+                    payload["status_details"] = f"{good_matches} good keyword{'s' if good_matches != 1 else ''} and {bad_matches} bad keyoword{'s' if good_matches != 1 else ''} matched"
                 elif good_matches > 0:
                     payload["status"] = "Approved"
                     payload["status_details"] = f"{good_matches} good keyword{'s' if good_matches != 1 else ''} matched"
@@ -417,7 +417,11 @@ class ArchiveBackend:
         return payload
 
     def _count_keyword_matches(self, text: str, keywords: list) -> int:
-        return sum(1 for kw in keywords if kw and kw.lower() in text)
+        text = text.lower()
+        return sum(
+            1 for kw in keywords
+            if kw and re.search(rf"\b{re.escape(kw.lower())}\b", text)
+        )
 
     def get_keyword_lists(self) -> tuple[list, list]:
         """Return ordered good and bad keyword lists from the KEYWORDS table."""

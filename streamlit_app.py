@@ -689,6 +689,7 @@ if check_password():
                     url = p.get("url") or "Unknown URL"
 
                     with st.expander(f"{prefix}{url} — {title}", expanded=(p.get("status") != "Approved")):
+                        st.markdown(f"**Domain URL:** {p.get('url')}")
                         st.markdown(f"**Original URL:** {p.get('link')}")
                         st.markdown(f"**Source:** {p.get('source')}")
                         st.write(f"**Response Code:** `{p.get('response_code')}`")
