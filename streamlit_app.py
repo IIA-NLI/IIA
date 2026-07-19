@@ -45,6 +45,21 @@ def normalize_user_name(raw_value: str | None) -> str | None:
     return None
 
 
+def resolve_status_details(
+    status: str,
+    provided_details: str | None = None,
+    fallback_details: str | None = None,
+    status_changed: bool = False,
+) -> str:
+    if not status_changed:
+        return fallback_details or provided_details or ""
+    if status in {"Not relevant", "Not sure"}:
+        return "Determined by user"
+    if status == "Approved":
+        return provided_details or fallback_details or "Determined by user"
+    return provided_details or fallback_details or ""
+
+
 # --- AUTHENTICATION SHIELD ---
 def check_password():
     """Returns True if the user entered the correct password and a valid user name."""
@@ -385,8 +400,14 @@ if check_password():
                                 edited_langs_str = st.session_state.get(f"langs_{idx}", "")
                                 cleaned_langs = [l.strip() for l in edited_langs_str.split(",") if l.strip()]
 
+                                previous_status = payload.get("status")
                                 payload["status"] = edited_status
-                                payload["status_details"] = edited_status_details if edited_status == "Approved" else ""
+                                payload["status_details"] = resolve_status_details(
+                                    edited_status,
+                                    edited_status_details,
+                                    payload.get("status_details"),
+                                    status_changed=(edited_status != previous_status),
+                                )
                                 payload["title"] = edited_title or None
                                 payload["description"] = edited_description or None
                                 payload["languages"] = cleaned_langs if cleaned_langs else None
@@ -433,7 +454,22 @@ if check_password():
 
                             df["languages"] = df["languages"].apply(normalize_langs)
 
-                        ordered_cols = ["id", "url", "status", "status_details", "response_code", "title", "title_english", "languages", "source", "updated_at"]
+                        ordered_cols = [
+                            "id",
+                            "url",
+                            "title",
+                            "description",
+                            "title_english",
+                            "description_english",
+                            "languages",
+                            "status",
+                            "status_details",
+                            "source",
+                            "response_code",
+                            "user",
+                            "created_at",
+                            "updated_at"
+                        ]
                         existing_cols = [c for c in ordered_cols if c in df.columns]
                         df = df[existing_cols]
                         st.dataframe(df, use_container_width=True, hide_index=True)
@@ -531,8 +567,14 @@ if check_password():
 
                                 if save_btn:
                                     updated_row = row.copy()
+                                    previous_status = row.get("status")
                                     updated_row["status"] = edited_status
-                                    updated_row["status_details"] = edited_details or updated_row.get("status_details")
+                                    updated_row["status_details"] = resolve_status_details(
+                                        edited_status,
+                                        edited_details,
+                                        updated_row.get("status_details"),
+                                        status_changed=(edited_status != previous_status),
+                                    )
                                     updated_row["title"] = edited_title or None
                                     updated_row["description"] = edited_description or None
                                     updated_row["title_english"] = edited_title_en or None
@@ -540,13 +582,20 @@ if check_password():
                                     cleaned_langs = [l.strip() for l in edited_langs.split(",") if l.strip()]
                                     if cleaned_langs:
                                         updated_row["languages"] = {lang: 1.0 for lang in cleaned_langs}
-                                    try:
-                                        backend.insert_domain(updated_row)
-                                        st.success(f"Saved updates for {row.get('url')}")
-                                        st.session_state[edit_key] = False
-                                        st.rerun()
-                                    except Exception as e:
-                                        st.error(f"Failed to save record: {e}")
+                                    # Ensure current session user is recorded as the last editor
+                                    session_user = normalize_user_name(get_session_user())
+                                    if not session_user:
+                                        st.error("User must be one of: Hana, Roi, Yehonatan.")
+                                    else:
+                                        updated_row["user"] = session_user
+                                        # Do not touch created_at here; backend will preserve it on upsert
+                                        try:
+                                            backend.insert_domain(updated_row)
+                                            st.success(f"Saved updates for {row.get('url')}")
+                                            st.session_state[edit_key] = False
+                                            st.rerun()
+                                        except Exception as e:
+                                            st.error(f"Failed to save record: {e}")
                                 elif cancel_btn:
                                     st.session_state[edit_key] = False
                                     st.rerun()
@@ -733,11 +782,14 @@ if check_password():
 
                     cleaned_langs = [l.strip() for l in langs_str.split(",") if l.strip()]
 
+                    previous_status = updated_payload.get("status")
                     updated_payload["status"] = status
-                    if updated_payload["status"] == "Approved":
-                        updated_payload["status_details"] = details or "Determined by user"
-                    else:
-                        updated_payload["status_details"] = details or updated_payload.get("status_details")
+                    updated_payload["status_details"] = resolve_status_details(
+                        updated_payload["status"],
+                        details,
+                        updated_payload.get("status_details"),
+                        status_changed=(status != previous_status),
+                    )
 
                     if cleaned_langs:
                         updated_payload["languages"] = cleaned_langs

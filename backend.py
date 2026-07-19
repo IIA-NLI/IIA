@@ -463,6 +463,13 @@ class ArchiveBackend:
             if kw and re.search(rf"\b{re.escape(kw.lower())}\b", text)
         )
 
+    def _is_government_domain(self, hostname: str | None) -> bool:
+        """Return True when a hostname belongs to a government domain."""
+        host = (hostname or "").strip().lower().strip(".")
+        if not host:
+            return False
+        return host == "gov" or host.endswith(".gov") or ".gov." in host
+
     def get_keyword_lists(self) -> tuple[list, list]:
         """Return ordered good and bad keyword lists from the KEYWORDS table."""
         rows = self.get_all_keywords() or []
@@ -513,6 +520,10 @@ class ArchiveBackend:
             parsed = urlparse(raw)
             netloc = (parsed.netloc or "").lower()
             if not netloc:
+                continue
+
+            hostname = (parsed.hostname or "").lower()
+            if self._is_government_domain(hostname):
                 continue
 
             domain_key = netloc[4:] if netloc.startswith("www.") else netloc
@@ -597,9 +608,39 @@ class ArchiveBackend:
     def insert_domain(self, payload: dict):
         """Upserts processed metadata into the DOMAINS table using strictly Jerusalem time."""
         now_iso = self._now_jerusalem_iso()
-        if not payload.get("created_at"):
-            payload["created_at"] = now_iso
+        # Preserve original `created_at` when updating an existing record.
+        existing_row = None
+        try:
+            if payload.get("url"):
+                resp = (
+                    self.supabase.table("DOMAINS")
+                    .select("*")
+                    .eq("url", payload.get("url"))
+                    .limit(1)
+                    .execute()
+                )
+                if resp and getattr(resp, "data", None):
+                    if resp.data:
+                        existing_row = resp.data[0]
+        except Exception:
+            existing_row = None
+
+        if existing_row and existing_row.get("created_at"):
+            payload["created_at"] = existing_row.get("created_at")
+        else:
+            # New record: ensure created_at is set
+            if not payload.get("created_at"):
+                payload["created_at"] = now_iso
+
+        # Always update the updated_at timestamp
         payload["updated_at"] = now_iso
+
+        # If a `user` value is provided in the payload, use it (this will overwrite
+        # any previous user and ensure only the last user is saved). If not provided,
+        # preserve existing user when updating.
+        if existing_row:
+            if not payload.get("user") and existing_row.get("user"):
+                payload["user"] = existing_row.get("user")
 
         sanitized = self._sanitize_domain_payload(payload)
         return (
