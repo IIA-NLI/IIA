@@ -115,18 +115,58 @@ class ArchiveBackend:
         )
         description = desc_tag["content"].strip() if desc_tag and desc_tag.get("content") else ""
 
+        # Discard placeholder metadata values that are not meaningful.
+        invalid_placeholders = {"just a moment..."}
+        if title and title.strip().lower() in invalid_placeholders:
+            title = ""
+        if description and description.strip().lower() in invalid_placeholders:
+            description = ""
+
         # Language Detection
         detected_langs = []
         combined_text = f"{title} {description}".strip()
 
-        if combined_text:
-            try:
-                predictions = detect_langs(combined_text)
-                detected_langs = [self._lang_code_to_name(p.lang) for p in predictions]
-            except Exception:
-                detected_langs = ["Unknown"]
-        else:
-            detected_langs = []
+        def _extract_page_language(soup_obj: BeautifulSoup) -> str | None:
+            html_tag = soup_obj.find("html")
+            if html_tag:
+                lang_value = html_tag.get("lang") or html_tag.get("xml:lang")
+                if lang_value:
+                    return lang_value.strip()
+
+            meta_lang = soup_obj.find("meta", attrs={"http-equiv": "Content-Language"})
+            if meta_lang and meta_lang.get("content"):
+                return meta_lang["content"].strip()
+
+            meta_lang = soup_obj.find("meta", attrs={"name": "language"})
+            if meta_lang and meta_lang.get("content"):
+                return meta_lang["content"].strip()
+
+            return None
+
+        page_lang = _extract_page_language(soup)
+        if page_lang:
+            lang_code = page_lang.lower().strip()
+            if ";" in lang_code:
+                lang_code = lang_code.split(";", 1)[0].strip()
+            if "," in lang_code:
+                lang_code = lang_code.split(",", 1)[0].strip()
+            if lang_code:
+                normalized = self._lang_name_to_code(lang_code) if not re.match(r"^[a-z]{2}(?:-[a-z]{2})?$", lang_code) else lang_code
+                detected_langs = [self._lang_code_to_name(normalized)]
+
+        if not detected_langs:
+            if combined_text:
+                try:
+                    predictions = detect_langs(combined_text)
+                    filtered = [p for p in predictions if getattr(p, "prob", 0.0) > 0.5]
+                    if filtered:
+                        detected_langs = [self._lang_code_to_name(p.lang) for p in filtered]
+                    else:
+                        detected_langs = ["Unknown"]
+                except Exception:
+                    detected_langs = ["Unknown"]
+            else:
+                detected_langs = []
 
         # Translation Management
         title_english = title
