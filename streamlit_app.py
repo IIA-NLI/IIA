@@ -26,23 +26,64 @@ except Exception:
 
 backend = get_backend()
 
+ALLOWED_USER_NAMES = ["hana", "roi", "yehonatan"]
+
+
+def get_session_user() -> str:
+    if "domain_user" not in st.session_state:
+        st.session_state["domain_user"] = ""
+    return st.session_state["domain_user"]
+
+
+def normalize_user_name(raw_value: str | None) -> str | None:
+    value = (raw_value or "").strip()
+    if not value:
+        return None
+    for allowed_name in ALLOWED_USER_NAMES:
+        if value.lower() == allowed_name.lower():
+            return allowed_name
+    return None
+
 
 # --- AUTHENTICATION SHIELD ---
 def check_password():
-    """Returns True if the user entered the correct password."""
+    """Returns True if the user entered the correct password and a valid user name."""
     def password_entered():
-        if st.session_state["password"] == st.secrets["APP_PASSWORD"]:
+        entered_user = normalize_user_name(st.session_state.get("password_user_input", ""))
+        if st.session_state.get("password") == st.secrets["APP_PASSWORD"] and entered_user:
             st.session_state["password_correct"] = True
-            del st.session_state["password"]
+            st.session_state["domain_user"] = entered_user
+            st.session_state.pop("password", None)
         else:
             st.session_state["password_correct"] = False
 
     if "password_correct" not in st.session_state:
-        st.text_input("Please enter your access password", type="password", on_change=password_entered, key="password")
+        with st.form("auth_form"):
+            st.text_input(
+                "User",
+                value=get_session_user(),
+                key="password_user_input",
+            )
+            st.text_input("Password", type="password", key="password")
+            submitted = st.form_submit_button("Continue")
+
+        if submitted:
+            password_entered()
         return False
     elif not st.session_state["password_correct"]:
-        st.text_input("Please enter your access password", type="password", on_change=password_entered, key="password")
-        st.error("😕 Password incorrect")
+        with st.form("auth_form"):
+            st.text_input("Please enter your access password", type="password", key="password")
+            st.text_input(
+                "User",
+                value=get_session_user(),
+                help="Enter one name only: Hana, Roi, or Yehonatan.",
+                key="password_user_input",
+            )
+            submitted = st.form_submit_button("Continue")
+
+        if submitted:
+            password_entered()
+        st.error("😕 Password incorrect or invalid user")
         return False
     else:
         return True
@@ -82,84 +123,91 @@ if check_password():
             fetch_btn = st.form_submit_button("Analyze Domain")
 
         if fetch_btn:
-            urls = [u.strip() for u in re.split(r"[\n,]+", input_url) if u.strip()]
-            if not urls:
-                st.warning("Please specify at least one URL first.")
+            entered_user = normalize_user_name(get_session_user())
+            if not entered_user:
+                st.error("User must be one of: Hana, Roi, Yehonatan.")
             else:
-                invalid_urls = [u for u in urls if not backend.is_valid_url_format(u)]
-                if invalid_urls:
-                    st.error(
-                        "❌ Invalid URL structure found. Please remove or fix the following entries: "
-                        + ", ".join(invalid_urls)
-                    )
+                st.session_state["domain_user"] = entered_user
+                urls = [u.strip() for u in re.split(r"[\n,]+", input_url) if u.strip()]
+                if not urls:
+                    st.warning("Please specify at least one URL first.")
+                else:
+                    invalid_urls = [u for u in urls if not backend.is_valid_url_format(u)]
+                    if invalid_urls:
+                        st.error(
+                            "❌ Invalid URL structure found. Please remove or fix the following entries: "
+                            + ", ".join(invalid_urls)
+                        )
 
-                valid_urls = [u for u in urls if backend.is_valid_url_format(u)]
-                if not valid_urls:
-                    st.session_state["show_editor"] = False
-                elif len(valid_urls) == 1:
-                    input_url = valid_urls[0]
-                    manual_info = backend.prepare_manual_url(input_url)
-
-                    if manual_info["has_extra_path"]:
-                        st.session_state["manual_original_url"] = manual_info["normalized_url"]
-                        st.session_state["manual_trimmed_url"] = manual_info["trimmed_url"]
-                        st.session_state["manual_pending_domain"] = manual_info["domain_key"]
-                        st.session_state["manual_url_needs_choice"] = True
-                        st.session_state["manual_domain_exists"] = False
+                    valid_urls = [u for u in urls if backend.is_valid_url_format(u)]
+                    if not valid_urls:
                         st.session_state["show_editor"] = False
-                    else:
-                        st.session_state["manual_url_needs_choice"] = False
-                        st.session_state["manual_pending_url"] = manual_info["normalized_url"]
-                        st.session_state["manual_pending_domain"] = manual_info["domain_key"]
-                        if manual_info["domain_exists"]:
-                            st.session_state["manual_domain_exists"] = True
+                    elif len(valid_urls) == 1:
+                        input_url = valid_urls[0]
+                        manual_info = backend.prepare_manual_url(input_url)
+
+                        if manual_info["has_extra_path"]:
+                            st.session_state["manual_original_url"] = manual_info["normalized_url"]
+                            st.session_state["manual_trimmed_url"] = manual_info["trimmed_url"]
+                            st.session_state["manual_pending_domain"] = manual_info["domain_key"]
+                            st.session_state["manual_url_needs_choice"] = True
+                            st.session_state["manual_domain_exists"] = False
                             st.session_state["show_editor"] = False
                         else:
-                            with st.spinner("Analyzing and parsing remote server contents..."):
-                                scraped_payload = backend.analyze_and_extract_url(manual_info["normalized_url"])
+                            st.session_state["manual_url_needs_choice"] = False
+                            st.session_state["manual_pending_url"] = manual_info["normalized_url"]
+                            st.session_state["manual_pending_domain"] = manual_info["domain_key"]
+                            if manual_info["domain_exists"]:
+                                st.session_state["manual_domain_exists"] = True
+                                st.session_state["show_editor"] = False
+                            else:
+                                with st.spinner("Analyzing and parsing remote server contents..."):
+                                    scraped_payload = backend.analyze_and_extract_url(manual_info["normalized_url"])
+                                    scraped_payload = backend.evaluate_payload(
+                                        scraped_payload,
+                                        good_keywords=good_kw_list,
+                                        bad_keywords=bad_kw_list,
+                                    )
+                                scraped_payload["status"] = "Approved"
+                                scraped_payload["link"] = manual_info["normalized_url"]
+                                scraped_payload["user"] = entered_user
+                                st.session_state["manual_payloads"] = [scraped_payload]
+                                st.session_state["show_editor"] = True
+                                st.session_state["manual_domain_exists"] = False
+                    else:
+                        batch_payloads = []
+                        skipped_existing = []
+                        with st.spinner("Analyzing and parsing remote server contents..."):
+                            for url in valid_urls:
+                                manual_info = backend.prepare_manual_url(url)
+                                if manual_info["domain_exists"]:
+                                    skipped_existing.append(manual_info["normalized_url"])
+                                    continue
+
+                                analysis_url = manual_info["trimmed_url"] if manual_info["has_extra_path"] else manual_info["normalized_url"]
+                                scraped_payload = backend.analyze_and_extract_url(analysis_url)
                                 scraped_payload = backend.evaluate_payload(
                                     scraped_payload,
                                     good_keywords=good_kw_list,
                                     bad_keywords=bad_kw_list,
                                 )
-                            scraped_payload["status"] = "Approved"
-                            scraped_payload["link"] = manual_info["normalized_url"]
-                            st.session_state["manual_payloads"] = [scraped_payload]
-                            st.session_state["show_editor"] = True
-                            st.session_state["manual_domain_exists"] = False
-                else:
-                    batch_payloads = []
-                    skipped_existing = []
-                    with st.spinner("Analyzing and parsing remote server contents..."):
-                        for url in valid_urls:
-                            manual_info = backend.prepare_manual_url(url)
-                            if manual_info["domain_exists"]:
-                                skipped_existing.append(manual_info["normalized_url"])
-                                continue
+                                scraped_payload["status"] = "Approved"
+                                scraped_payload["link"] = analysis_url
+                                scraped_payload["original_input"] = url
+                                scraped_payload["user"] = entered_user
+                                batch_payloads.append(scraped_payload)
 
-                            analysis_url = manual_info["trimmed_url"] if manual_info["has_extra_path"] else manual_info["normalized_url"]
-                            scraped_payload = backend.analyze_and_extract_url(analysis_url)
-                            scraped_payload = backend.evaluate_payload(
-                                scraped_payload,
-                                good_keywords=good_kw_list,
-                                bad_keywords=bad_kw_list,
+                        if skipped_existing:
+                            st.info(
+                                "The following domains were already present and were skipped: "
+                                + ", ".join(skipped_existing)
                             )
-                            scraped_payload["status"] = "Approved"
-                            scraped_payload["link"] = analysis_url
-                            scraped_payload["original_input"] = url
-                            batch_payloads.append(scraped_payload)
 
-                    if skipped_existing:
-                        st.info(
-                            "The following domains were already present and were skipped: "
-                            + ", ".join(skipped_existing)
-                        )
-
-                    if batch_payloads:
-                        st.session_state["manual_payloads"] = batch_payloads
-                        st.session_state["show_editor"] = True
-                    else:
-                        st.session_state["show_editor"] = False
+                        if batch_payloads:
+                            st.session_state["manual_payloads"] = batch_payloads
+                            st.session_state["show_editor"] = True
+                        else:
+                            st.session_state["show_editor"] = False
 
         if st.session_state.get("manual_url_needs_choice"):
             st.warning(
@@ -195,6 +243,7 @@ if check_password():
                             bad_keywords=bad_kw_list,
                         )
                         scraped_payload["link"] = analysis_url
+                        scraped_payload["user"] = st.session_state.get("domain_user", "")
                         st.session_state["current_payload"] = scraped_payload
                         st.session_state["show_editor"] = True
                         st.session_state["manual_domain_exists"] = False
@@ -219,6 +268,7 @@ if check_password():
                             bad_keywords=bad_kw_list,
                         )
                         scraped_payload["link"] = st.session_state.get("manual_pending_url")
+                        scraped_payload["user"] = st.session_state.get("domain_user", "")
                         st.session_state["current_payload"] = scraped_payload
                         st.session_state["show_editor"] = True
                 else:
@@ -322,36 +372,42 @@ if check_password():
                     if submit_to_db:
                         committed = []
                         failed = []
-                        for idx, payload in enumerate(payloads):
-                            edited_status = st.session_state.get(f"status_{idx}", "Approved")
-                            edited_status_details = st.session_state.get(f"details_{idx}", payload.get("status_details", ""))
-                            edited_title = st.session_state.get(f"title_{idx}", payload.get("title") or "")
-                            edited_description = st.session_state.get(f"description_{idx}", payload.get("description") or "")
-                            edited_langs_str = st.session_state.get(f"langs_{idx}", "")
-                            cleaned_langs = [l.strip() for l in edited_langs_str.split(",") if l.strip()]
+                        session_user = normalize_user_name(get_session_user())
+                        if not session_user:
+                            st.error("User must be one of: Hana, Roi, Yehonatan.")
+                        else:
+                            st.session_state["domain_user"] = session_user
+                            for idx, payload in enumerate(payloads):
+                                edited_status = st.session_state.get(f"status_{idx}", "Approved")
+                                edited_status_details = st.session_state.get(f"details_{idx}", payload.get("status_details", ""))
+                                edited_title = st.session_state.get(f"title_{idx}", payload.get("title") or "")
+                                edited_description = st.session_state.get(f"description_{idx}", payload.get("description") or "")
+                                edited_langs_str = st.session_state.get(f"langs_{idx}", "")
+                                cleaned_langs = [l.strip() for l in edited_langs_str.split(",") if l.strip()]
 
-                            payload["status"] = edited_status
-                            payload["status_details"] = edited_status_details if edited_status == "Approved" else ""
-                            payload["title"] = edited_title or None
-                            payload["description"] = edited_description or None
-                            payload["languages"] = cleaned_langs if cleaned_langs else None
-                            payload["source"] = global_source
-                            payload.pop("link", None)
-                            payload.pop("original_input", None)
+                                payload["status"] = edited_status
+                                payload["status_details"] = edited_status_details if edited_status == "Approved" else ""
+                                payload["title"] = edited_title or None
+                                payload["description"] = edited_description or None
+                                payload["languages"] = cleaned_langs if cleaned_langs else None
+                                payload["source"] = global_source
+                                payload["user"] = session_user
+                                payload.pop("link", None)
+                                payload.pop("original_input", None)
 
-                            try:
-                                backend.insert_domain(payload)
-                                committed.append(payload["url"])
-                            except Exception as db_err:
-                                failed.append((payload.get("url"), str(db_err)))
+                                try:
+                                    backend.insert_domain(payload)
+                                    committed.append(payload["url"])
+                                except Exception as db_err:
+                                    failed.append((payload.get("url"), str(db_err)))
 
-                        if committed:
-                            st.success(f"Successfully registered {len(committed)} URL(s) to the Database!")
-                            st.session_state["show_editor"] = False
-                            st.session_state.pop("manual_payloads", None)
-                        if failed:
-                            for failed_url, err in failed:
-                                st.error(f"Failed to save {failed_url}: {err}")
+                            if committed:
+                                st.success(f"Successfully registered {len(committed)} URL(s) to the Database!")
+                                st.session_state["show_editor"] = False
+                                st.session_state.pop("manual_payloads", None)
+                            if failed:
+                                for failed_url, err in failed:
+                                    st.error(f"Failed to save {failed_url}: {err}")
 
     # --- VIEW 2: CENTRAL URL EXPLORER ENGINE ---
     elif option == "🌐 Domains Database Explorer":
@@ -576,30 +632,35 @@ if check_password():
         if run_search:
             clear_processed_review_state()
 
-            if not keywords_query.strip():
-                st.warning("Please provide keywords to search for.")
+            entered_user = normalize_user_name(get_session_user())
+            if not entered_user:
+                st.error("User must be one of: Hana, Roi, Yehonatan.")
             else:
-                keywords = [k.strip() for k in keywords_query.split(",") if k.strip()]
-                try:
-                    processed = backend.search_google_keywords(
-                        keywords,
-                        language=language,
-                        limit=limit,
-                        include_inurl=include_inurl,
-                        homepage_only=homepage_only,
-                        site_domain=site_domain.strip() if site_domain else None,
-                        date_from=date_from.isoformat() if date_from else None,
-                        date_to=date_to.isoformat() if date_to else None,
-                    )
-                except Exception as e:
-                    st.error(f"Search failed: {e}")
-                    processed = []
+                st.session_state["domain_user"] = entered_user
+                if not keywords_query.strip():
+                    st.warning("Please provide keywords to search for.")
+                else:
+                    keywords = [k.strip() for k in keywords_query.split(",") if k.strip()]
+                    try:
+                        processed = backend.search_google_keywords(
+                            keywords,
+                            language=language,
+                            limit=limit,
+                            include_inurl=include_inurl,
+                            homepage_only=homepage_only,
+                            site_domain=site_domain.strip() if site_domain else None,
+                            date_from=date_from.isoformat() if date_from else None,
+                            date_to=date_to.isoformat() if date_to else None,
+                        )
+                    except Exception as e:
+                        st.error(f"Search failed: {e}")
+                        processed = []
 
-                st.success(f"Collected {len(processed)} unique domain roots from search results.")
-                st.session_state["ordered_processed"] = (
-                    [p for p in processed if p.get("status") != "Approved"]
-                    + [p for p in processed if p.get("status") == "Approved"]
-                )
+                    st.success(f"Collected {len(processed)} unique domain roots from search results.")
+                    st.session_state["ordered_processed"] = (
+                        [p for p in processed if p.get("status") != "Approved"]
+                        + [p for p in processed if p.get("status") == "Approved"]
+                    )
 
         ordered_processed = st.session_state.get("ordered_processed", [])
 
@@ -686,20 +747,26 @@ if check_password():
 
                 if to_commit:
                     saved = 0
-                    for item in to_commit:
-                        try:
-                            item.pop("link", None)
-                            backend.insert_domain(item)
-                            saved += 1
-                        except Exception as e:
-                            st.error(f"Failed to save {item.get('url')}: {e}")
+                    session_user = normalize_user_name(get_session_user())
+                    if not session_user:
+                        st.error("User must be one of: Hana, Roi, Yehonatan.")
+                    else:
+                        st.session_state["domain_user"] = session_user
+                        for item in to_commit:
+                            try:
+                                item.pop("link", None)
+                                item["user"] = session_user
+                                backend.insert_domain(item)
+                                saved += 1
+                            except Exception as e:
+                                st.error(f"Failed to save {item.get('url')}: {e}")
 
-                    if saved:
-                        st.success(f"Saved {saved} records to the archive.")
-                        with st.spinner("Refreshing..."):
-                            time.sleep(2)
-                        clear_processed_review_state()
-                        st.rerun()
+                        if saved:
+                            st.success(f"Saved {saved} records to the archive.")
+                            with st.spinner("Refreshing..."):
+                                time.sleep(2)
+                            clear_processed_review_state()
+                            st.rerun()
                 else:
                     st.info("No records to commit.")
 

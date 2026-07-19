@@ -542,6 +542,7 @@ class ArchiveBackend:
             "status_details",
             "response_code",
             "source",
+            "user",
             "created_at",
             "updated_at",
             "id",
