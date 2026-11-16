@@ -338,19 +338,11 @@ class ArchiveBackend:
 
         if not language:
             language_code = "en"
+        elif re.match(r"^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,4})?$", language.strip()):
+            # Already a language code such as "he", "pt-BR" or "es-419"
+            language_code = language.strip()
         else:
-            if len(language) > 2 and not ("-" in language and len(language) <= 5):
-                language_code = self._lang_name_to_code(language)
-            else:
-                language_code = language
-
-        if not language:
-            language_code = "en"
-        else:
-            if len(language) > 2 and not ("-" in language and len(language) <= 5):
-                language_code = self._lang_name_to_code(language)
-            else:
-                language_code = language
+            language_code = self._lang_name_to_code(language)
 
         lang_for_hl = (language_code or "en")
         lang_for_lr = (language_code.split("-")[0].lower() if language_code else "en")
@@ -661,36 +653,53 @@ class ArchiveBackend:
 
     def search_domains(self, query: str) -> list:
         """Queries the database looking for a keyword string across multiple columns."""
-        match_str = f"%{query}%"
-        response = (
-            self.supabase.table("DOMAINS")
-            .select("*")
-            .or_(
-                f"url.ilike.{match_str},title.ilike.{match_str},description.ilike.{match_str},title_english.ilike.{match_str},description_english.ilike.{match_str}"
+        # Commas, parentheses and line breaks separate the search into several
+        # terms; each term is searched in turn and the results are combined.
+        rows_by_id = {}
+        for term in self._split_search_terms(query):
+            match_str = f"%{term}%"
+            response = (
+                self.supabase.table("DOMAINS")
+                .select("*")
+                .or_(
+                    f"url.ilike.{match_str},title.ilike.{match_str},description.ilike.{match_str},title_english.ilike.{match_str},description_english.ilike.{match_str}"
+                )
+                .order("id", desc=True)
+                .execute()
             )
-            .order("id", desc=True)
-            .execute()
-        )
-        return response.data
+            for row in response.data or []:
+                rows_by_id.setdefault(row["id"], row)
+        return sorted(rows_by_id.values(), key=lambda r: r["id"], reverse=True)
+
+    def _split_search_terms(self, query: str) -> list:
+        """Split search text on commas, parentheses and line breaks."""
+        return [t.strip() for t in re.split(r"[,()\n]+", query or "") if t.strip()]
 
     def advanced_search_domains(self, filters: dict) -> list:
         """Executes a compound multi-column advanced filter search query."""
-        query_builder = self.supabase.table("DOMAINS").select("*")
+        # Each text term (split on commas, parentheses, line breaks) is searched
+        # separately with the other filters applied, and the results are combined.
+        terms = self._split_search_terms(filters.get("text_query")) or [None]
+        rows_by_id = {}
+        for term in terms:
+            query_builder = self.supabase.table("DOMAINS").select("*")
 
-        if filters.get("text_query"):
-            match_str = f"%{filters['text_query']}%"
-            query_builder = query_builder.or_(
-                f"url.ilike.{match_str},title.ilike.{match_str},description.ilike.{match_str},title_english.ilike.{match_str},description_english.ilike.{match_str}"
-            )
+            if term:
+                match_str = f"%{term}%"
+                query_builder = query_builder.or_(
+                    f"url.ilike.{match_str},title.ilike.{match_str},description.ilike.{match_str},title_english.ilike.{match_str},description_english.ilike.{match_str}"
+                )
 
-        if filters.get("status"):
-            query_builder = query_builder.eq("status", filters["status"])
-            
-        if filters.get("response_code"):
-            query_builder = query_builder.eq("response_code", filters["response_code"])
+            if filters.get("status"):
+                query_builder = query_builder.eq("status", filters["status"])
 
-        response = query_builder.order("id", desc=True).execute()
-        data = response.data
+            if filters.get("response_code"):
+                query_builder = query_builder.eq("response_code", filters["response_code"])
+
+            response = query_builder.order("id", desc=True).execute()
+            for row in response.data or []:
+                rows_by_id.setdefault(row["id"], row)
+        data = sorted(rows_by_id.values(), key=lambda r: r["id"], reverse=True)
 
         if filters.get("language") and data:
             target_lang = filters["language"].lower()

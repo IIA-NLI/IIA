@@ -84,6 +84,7 @@ def check_password():
 
         if submitted:
             password_entered()
+            st.rerun()
         return False
     elif not st.session_state["password_correct"]:
         with st.form("auth_form"):
@@ -98,6 +99,8 @@ def check_password():
 
         if submitted:
             password_entered()
+            if st.session_state.get("password_correct"):
+                st.rerun()
         st.error("😕 Password incorrect or invalid user")
         return False
     else:
@@ -534,7 +537,7 @@ if check_password():
                             st.write(f"**English Title:** {row.get('title_english')}")
                             st.write(f"**English Description:** {row.get('description_english')}")
                         with col4:
-                            st.write(f"**Languages Map:** `{row.get('languages')}`")
+                            st.write(f"**Languages Map:** `{row.get('languages') or 'Unknown'}`")
                         st.caption(f"Source: `{row.get('source')}` | Updated: {row.get('updated_at')}")
 
                         if st.session_state.get(edit_key, False):
@@ -555,6 +558,8 @@ if check_password():
                                     langs_csv = ", ".join(langs_value.keys())
                                 elif isinstance(langs_value, list):
                                     langs_csv = ", ".join(str(l) for l in langs_value)
+                                elif langs_value is None:
+                                    langs_csv = "Unknown"
                                 else:
                                     langs_csv = str(langs_value)
                                 edited_langs = st.text_input("Languages (comma-separated):", value=langs_csv)
