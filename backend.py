@@ -702,12 +702,17 @@ class ArchiveBackend:
         data = sorted(rows_by_id.values(), key=lambda r: r["id"], reverse=True)
 
         if filters.get("language") and data:
-            target_lang = filters["language"].lower()
+            target_lang = filters["language"].strip().lower()
+            # Accept both a name ("Hebrew") and a code ("he"): a code is also
+            # matched against its language name, since names are what is stored.
+            wanted_langs = {target_lang}
+            if re.match(r"^[a-z]{2,3}(-[a-z0-9]{2,4})?$", target_lang):
+                wanted_langs.add(self._lang_code_to_name(target_lang).lower())
             data = [
                 row for row in data
                 if (
-                    (isinstance(row.get("languages"), dict) and target_lang in row["languages"])
-                    or (isinstance(row.get("languages"), list) and any(str(lang).lower() == target_lang for lang in row.get("languages", [])))
+                    (isinstance(row.get("languages"), dict) and any(str(lang).lower() in wanted_langs for lang in row["languages"]))
+                    or (isinstance(row.get("languages"), list) and any(str(lang).lower() in wanted_langs for lang in row.get("languages", [])))
                 )
             ]
 

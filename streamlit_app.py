@@ -514,12 +514,17 @@ if check_password():
                             except ValueError: st.warning("Response code filter skipped.")
 
                         results = backend.advanced_search_domains(filters)
+                        st.session_state["adv_results"] = results
+                else:
+                    # Keep showing the last advanced search so that Edit / Save keep working
+                    results = st.session_state.get("adv_results")
 
             if results is not None:
                 st.write(f"Query returned **{len(results)}** matching index records.")
                 for idx, row in enumerate(results):
                     header_title = row.get("title") or row.get("title_english") or "No Title Available"
-                    edit_key = f"edit_record_{idx}"
+                    row_id = row.get("id", idx)
+                    edit_key = f"edit_record_{row_id}"
                     with st.expander(f"🌐 {row['url']} — {header_title}"):
                         col1, col2 = st.columns([3, 1])
                         with col1:
@@ -541,7 +546,7 @@ if check_password():
                         st.caption(f"Source: `{row.get('source')}` | Updated: {row.get('updated_at')}")
 
                         if st.session_state.get(edit_key, False):
-                            with st.form(f"edit_row_form_{idx}"):
+                            with st.form(f"edit_row_form_{row_id}"):
                                 st.markdown("### Edit this record")
                                 edited_status = st.selectbox(
                                     "Status:",
@@ -596,6 +601,11 @@ if check_password():
                                         # Do not touch created_at here; backend will preserve it on upsert
                                         try:
                                             backend.insert_domain(updated_row)
+                                            if "adv_results" in st.session_state:
+                                                st.session_state["adv_results"] = [
+                                                    updated_row if r.get("id") == updated_row.get("id") else r
+                                                    for r in st.session_state["adv_results"]
+                                                ]
                                             st.success(f"Saved updates for {row.get('url')}")
                                             st.session_state[edit_key] = False
                                             st.rerun()
