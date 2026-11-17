@@ -1,5 +1,6 @@
 import json
 import re
+import time
 import httpx
 from bs4 import BeautifulSoup
 from deep_translator import GoogleTranslator
@@ -19,6 +20,11 @@ try:
     from googleapiclient.discovery import build
 except Exception:
     build = None
+
+
+# A Hebrew word: 2 or more Hebrew letters in a row (niqqud allowed between them).
+# Includes the Yiddish ligatures, so Yiddish and Ladino text written in Hebrew script counts too.
+HEBREW_WORD = re.compile(r"(?:[א-תװ-ײ][֑-ׇ]*){2,}")
 
 
 class ArchiveBackend:
@@ -169,22 +175,21 @@ class ArchiveBackend:
                 detected_langs = []
 
         # Translation Management
+        # Title and description are translated separately; a failure is retried once and
+        # is flagged (translation_failed) instead of being ignored silently. Text that
+        # already looks English is not sent to the translator.
         title_english = title
         description_english = description
-        dominant_lang = detected_langs[0] if detected_langs else "en"
+        translation_failed = False
 
-        if detected_langs and dominant_lang != "en":
-            try:
-                if title:
-                    title_english = GoogleTranslator(
-                        source="auto", target="en"
-                    ).translate(title)
-                if description:
-                    description_english = GoogleTranslator(
-                        source="auto", target="en"
-                    ).translate(description)
-            except Exception:
-                pass  
+        if combined_text and not self._looks_english(combined_text):
+            if title:
+                title_english, ok = self._translate_to_english(title)
+                translation_failed = translation_failed or not ok
+            if description:
+                description_english, ok = self._translate_to_english(description)
+                translation_failed = translation_failed or not ok
+            self._record_translation_result(translation_failed)
 
         return {
             "url": url,
@@ -199,7 +204,50 @@ class ArchiveBackend:
             "status_details": status_details,
             "source": "manually",
             "response_code": response_code,
+            "translation_failed": translation_failed,
         }
+
+    def _looks_english(self, text: str) -> bool:
+        """True when the language detector is confident that the text is English."""
+        try:
+            predictions = detect_langs(text)
+            return bool(predictions) and predictions[0].lang == "en" and predictions[0].prob > 0.9
+        except Exception:
+            return False
+
+    def _translate_to_english(self, text: str) -> tuple:
+        """Translate text to English. Returns (text, ok); on failure returns the original text and ok=False.
+
+        Retries once. While a search is running, translation is skipped for the rest of the
+        search after 3 pages in a row failed to translate, so an outage cannot slow it down.
+        """
+        in_search = getattr(self, "_translation_breaker_active", False)
+        if in_search and getattr(self, "_translation_failures", 0) >= 3:
+            return text, False
+
+        for attempt in range(2):
+            try:
+                translated = GoogleTranslator(source="auto", target="en").translate(text)
+                if translated:
+                    return translated, True
+            except Exception:
+                pass
+            if attempt == 0:
+                time.sleep(1)
+        return text, False
+
+    def _record_translation_result(self, failed: bool) -> None:
+        """Count consecutive pages whose translation failed (used by the per-search breaker)."""
+        if getattr(self, "_translation_breaker_active", False):
+            self._translation_failures = (getattr(self, "_translation_failures", 0) + 1) if failed else 0
+
+    def _note_translation_failure(self, payload: dict) -> dict:
+        """Add 'translation failed' to the status details of a page whose translation failed."""
+        if payload.get("translation_failed"):
+            details = payload.get("status_details") or ""
+            if "translation failed" not in details:
+                payload["status_details"] = f"{details}; translation failed" if details else "translation failed"
+        return payload
 
     def normalize_manual_url(self, url: str) -> tuple[str, str, bool, str]:
         """Normalize a URL and return a consistent domain key for manual ingestion.
@@ -427,6 +475,13 @@ class ArchiveBackend:
                 good_matches = self._count_keyword_matches(normalized_text, good_keywords)
                 bad_matches = self._count_keyword_matches(normalized_text, bad_keywords)
 
+                # Hebrew letters (a word of 2+ letters; Yiddish/Ladino included) in the
+                # original title or description count as one good keyword.
+                original_text = f"{payload.get('title') or ''} {payload.get('description') or ''}"
+                hebrew_in_text = bool(HEBREW_WORD.search(original_text))
+                if hebrew_in_text:
+                    good_matches += 1
+
                 if good_matches > 0 and bad_matches > 0:
                     payload["status"] = "Not sure"
                     payload["status_details"] = f"{good_matches} good keyword{'s' if good_matches != 1 else ''} and {bad_matches} bad keyoword{'s' if good_matches != 1 else ''} matched"
@@ -442,11 +497,13 @@ class ArchiveBackend:
 
                 payload["matched_good_keywords"] = [kw for kw in good_keywords if kw.lower() in normalized_text]
                 payload["matched_bad_keywords"] = [kw for kw in bad_keywords if kw.lower() in normalized_text]
-                return payload
+                if hebrew_in_text:
+                    payload["matched_good_keywords"].append("Hebrew letters")
+                return self._note_translation_failure(payload)
 
         payload["matched_good_keywords"] = []
         payload["matched_bad_keywords"] = []
-        return payload
+        return self._note_translation_failure(payload)
 
     def _count_keyword_matches(self, text: str, keywords: list) -> int:
         text = text.lower()
@@ -547,16 +604,22 @@ class ArchiveBackend:
 
         good_keywords, bad_keywords = self.get_keyword_lists()
         processed = []
-        for link in root_urls:
-            payload = self.analyze_and_extract_url(link)
-            payload["link"] = domain_to_original_link.get(link, link)
-            if domain_to_keyword.get(link):
-                payload["source"] = f"Google search for {domain_to_keyword[link]}"
-            if self._is_unreachable(payload):
-                payload = self._mark_unreachable(payload)
-            else:
-                payload = self.evaluate_payload(payload, good_keywords=good_keywords, bad_keywords=bad_keywords)
-            processed.append(payload)
+        # Per-search translation breaker: see _translate_to_english
+        self._translation_breaker_active = True
+        self._translation_failures = 0
+        try:
+            for link in root_urls:
+                payload = self.analyze_and_extract_url(link)
+                payload["link"] = domain_to_original_link.get(link, link)
+                if domain_to_keyword.get(link):
+                    payload["source"] = f"Google search for {domain_to_keyword[link]}"
+                if self._is_unreachable(payload):
+                    payload = self._note_translation_failure(self._mark_unreachable(payload))
+                else:
+                    payload = self.evaluate_payload(payload, good_keywords=good_keywords, bad_keywords=bad_keywords)
+                processed.append(payload)
+        finally:
+            self._translation_breaker_active = False
 
         return processed
 

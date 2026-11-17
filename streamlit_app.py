@@ -815,6 +815,8 @@ if check_password():
                         text_fields = " ".join([str(p.get(k) or "") for k in ("title", "description", "title_english", "description_english")]).lower()
                         matched_good = [kw for kw in good_kw_list if kw.lower() in text_fields]
                         matched_bad = [kw for kw in bad_kw_list if kw.lower() in text_fields]
+                        if "Hebrew letters" in (p.get("matched_good_keywords") or []):
+                            matched_good.append("Hebrew letters")
 
                         st.markdown(f"**Good keywords:** {', '.join(matched_good) if matched_good else 'None'}")
                         st.markdown(f"**Bad keywords:** {', '.join(matched_bad) if matched_bad else 'None'}")
