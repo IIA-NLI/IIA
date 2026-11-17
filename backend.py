@@ -482,6 +482,7 @@ class ArchiveBackend:
     ) -> list:
         """Run Google search for keyword list and return normalized, analyzed payloads for review."""
         all_links = []
+        self.last_search_errors = []
         for kw in keywords:
             query = f"inurl:{kw}" if include_inurl else kw
             try:
@@ -493,9 +494,16 @@ class ArchiveBackend:
                     date_from=date_from,
                     date_to=date_to,
                 )
-            except Exception:
+            except Exception as e:
+                # Remember the failure so the user is told about it (bad key, quota, ...)
+                self.last_search_errors.append((kw, str(e)))
                 links = []
             all_links.extend([(l, kw) for l in links])
+
+        if keywords and len(self.last_search_errors) == len(keywords):
+            raise RuntimeError(
+                f"Google search failed for every keyword. First error: {self.last_search_errors[0][1]}"
+            )
 
         seen_domain_keys = set()
         root_urls = []
@@ -544,10 +552,37 @@ class ArchiveBackend:
             payload["link"] = domain_to_original_link.get(link, link)
             if domain_to_keyword.get(link):
                 payload["source"] = f"Google search for {domain_to_keyword[link]}"
-            payload = self.evaluate_payload(payload, good_keywords=good_keywords, bad_keywords=bad_keywords)
+            if self._is_unreachable(payload):
+                payload = self._mark_unreachable(payload)
+            else:
+                payload = self.evaluate_payload(payload, good_keywords=good_keywords, bad_keywords=bad_keywords)
             processed.append(payload)
 
         return processed
+
+    def _is_unreachable(self, payload: dict) -> bool:
+        """No response at all, 404, 410 or a server error (5xx). 403/401/429 count as reachable."""
+        code = payload.get("response_code")
+        return code is None or code in (404, 410) or code >= 500
+
+    def _mark_unreachable(self, payload: dict) -> dict:
+        """Label an unreachable site: Not relevant, except .il sites which stay Approved."""
+        code = payload.get("response_code")
+        reason = "no response" if code is None else f"HTTP {code}"
+        hostname = (urlparse(payload.get("url") or "").hostname or "").lower()
+        if hostname.endswith(".il"):
+            payload["status"] = "Approved"
+            payload["status_details"] = f".il suffix; unreachable ({reason})"
+        else:
+            payload["status"] = "Not relevant"
+            payload["status_details"] = f"Unreachable ({reason})"
+        if isinstance(payload.get("languages"), dict):
+            # A failed fetch carries a fake {"error": ...} language; drop it
+            payload["languages"] = None
+        payload["matched_good_keywords"] = []
+        payload["matched_bad_keywords"] = []
+        payload["unreachable"] = True
+        return payload
 
     def domain_exists(self, domain_url: str) -> bool:
         """Check whether a domain already exists in `DOMAINS`."""
@@ -640,6 +675,33 @@ class ArchiveBackend:
             .upsert(sanitized, on_conflict="url")
             .execute()
         )
+
+    def insert_domains_batch(self, payloads: list) -> int:
+        """Save many NEW domain rows in a single request (used by the search auto-save).
+
+        Rows whose url already exists are left untouched (never overwritten).
+        Raises on failure so the caller can fall back to saving row by row.
+        """
+        now_iso = self._now_jerusalem_iso()
+        columns = [
+            "url", "title", "description", "title_english", "description_english",
+            "languages", "status", "status_details", "response_code", "source", "user",
+        ]
+        rows = {}
+        for payload in payloads:
+            if not payload.get("url"):
+                continue
+            row = {col: payload.get(col) for col in columns}
+            row["created_at"] = now_iso
+            row["updated_at"] = now_iso
+            rows[row["url"]] = row
+        if rows:
+            (
+                self.supabase.table("DOMAINS")
+                .upsert(list(rows.values()), on_conflict="url", ignore_duplicates=True)
+                .execute()
+            )
+        return len(rows)
 
     def get_all_domains(self) -> list:
         """Fetches all records from the DOMAINS database table."""

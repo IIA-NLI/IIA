@@ -638,6 +638,15 @@ if check_password():
                 ):
                     del st.session_state[key]
             st.session_state.pop("ordered_processed", None)
+            st.session_state.pop("unreachable_processed", None)
+
+        def render_unreachable_list():
+            """Collapsed list of unreachable sites that were saved automatically."""
+            unreachable_rows = st.session_state.get("unreachable_processed", [])
+            if unreachable_rows:
+                with st.expander(f"Unreachable sites saved automatically ({len(unreachable_rows)})", expanded=False):
+                    for u in unreachable_rows:
+                        st.markdown(f"- {u.get('url')} — **{u.get('status')}** — {u.get('status_details')}")
 
         with st.form("keywords_search_form"):
             keywords_query = st.text_area(
@@ -706,24 +715,63 @@ if check_password():
                 else:
                     keywords = [k.strip() for k in keywords_query.split(",") if k.strip()]
                     try:
-                        processed = backend.search_google_keywords(
-                            keywords,
-                            language=language,
-                            limit=limit,
-                            include_inurl=include_inurl,
-                            homepage_only=homepage_only,
-                            site_domain=site_domain.strip() if site_domain else None,
-                            date_from=date_from.isoformat() if date_from else None,
-                            date_to=date_to.isoformat() if date_to else None,
-                        )
+                        with st.spinner("Searching Google and analyzing the results - this can take a few minutes..."):
+                            processed = backend.search_google_keywords(
+                                keywords,
+                                language=language,
+                                limit=limit,
+                                include_inurl=include_inurl,
+                                homepage_only=homepage_only,
+                                site_domain=site_domain.strip() if site_domain else None,
+                                date_from=date_from.isoformat() if date_from else None,
+                                date_to=date_to.isoformat() if date_to else None,
+                            )
                     except Exception as e:
                         st.error(f"Search failed: {e}")
                         processed = []
+                        search_failed = True
+                    else:
+                        search_failed = False
 
-                    st.success(f"Collected {len(processed)} unique domain roots from search results.")
+                    # Tell the user about keywords whose Google search failed (bad key, quota, ...)
+                    for failed_kw, failed_msg in getattr(backend, "last_search_errors", []):
+                        st.warning(f"Google search failed for '{failed_kw}': {failed_msg}")
+
+                    # Save every result right away with its automatic status.
+                    # Changes made later in the review form are saved with "Commit Changes to Archive".
+                    for p in processed:
+                        p["user"] = entered_user
+                    save_errors = []
+                    if processed:
+                        with st.spinner("Saving results to the archive..."):
+                            try:
+                                backend.insert_domains_batch(processed)
+                            except Exception:
+                                # Fall back to saving one by one so a single bad row doesn't block the rest
+                                for p in processed:
+                                    try:
+                                        backend.insert_domain(dict(p))
+                                    except Exception as save_err:
+                                        p["unsaved"] = True
+                                        save_errors.append((p.get("url"), str(save_err)))
+
+                    unreachable = [p for p in processed if p.get("unreachable")]
+                    reachable = [p for p in processed if not p.get("unreachable")]
+
+                    if processed:
+                        message = f"Collected {len(processed)} unique domain roots and saved them to the archive."
+                        if unreachable:
+                            message += f" {len(unreachable)} of them were unreachable (listed below the summary)."
+                        st.success(message)
+                    elif not search_failed:
+                        st.info("No new domains were found by this search.")
+                    for failed_url, failed_err in save_errors:
+                        st.error(f"Could not save {failed_url} yet (it will be retried on commit): {failed_err}")
+
+                    st.session_state["unreachable_processed"] = unreachable
                     st.session_state["ordered_processed"] = (
-                        [p for p in processed if p.get("status") != "Approved"]
-                        + [p for p in processed if p.get("status") == "Approved"]
+                        [p for p in reachable if p.get("status") != "Approved"]
+                        + [p for p in reachable if p.get("status") == "Approved"]
                     )
 
         ordered_processed = st.session_state.get("ordered_processed", [])
@@ -744,7 +792,9 @@ if check_password():
                 bad_kw_list = []
 
             st.subheader("Processed Results")
-            st.write(f"Auto-approved: {approved_count} | Unknowns requiring review: {unknown_count}")
+            # A code block shows a copy icon in its corner - copies only this summary line
+            st.code(f"Auto-approved: {approved_count} | Unknowns requiring review: {unknown_count}", language=None)
+            render_unreachable_list()
 
             with st.form("processed_review_form"):
                 for i, p in enumerate(ordered_processed):
@@ -780,7 +830,7 @@ if check_password():
                             langs_csv = ", ".join(langs_data)
                         st.text_input("Languages (comma-separated):", value=langs_csv, key=f"langs_{i}")
 
-                commit_all = st.form_submit_button("Commit All to Archive", key="commit_all_btn")
+                commit_all = st.form_submit_button("Commit Changes to Archive", key="commit_all_btn")
 
             if commit_all:
                 to_commit = []
@@ -797,6 +847,17 @@ if check_password():
 
                     cleaned_langs = [l.strip() for l in langs_str.split(",") if l.strip()]
 
+                    # Results are already saved automatically: only commit rows that were
+                    # changed in the form (or that could not be saved earlier).
+                    row_changed = (
+                        status != updated_payload.get("status")
+                        or (details or "") != (updated_payload.get("status_details") or "")
+                        or cleaned_langs != list(default_langs)
+                        or updated_payload.get("unsaved")
+                    )
+                    if not row_changed:
+                        continue
+
                     previous_status = updated_payload.get("status")
                     updated_payload["status"] = status
                     updated_payload["status_details"] = resolve_status_details(
@@ -812,6 +873,11 @@ if check_password():
                         updated_payload["languages"] = None
 
                     to_commit.append(updated_payload)
+
+                # Unreachable rows that could not be saved earlier are retried too
+                for u in st.session_state.get("unreachable_processed", []):
+                    if u.get("unsaved"):
+                        to_commit.append(u.copy())
 
                 if to_commit:
                     saved = 0
@@ -836,7 +902,14 @@ if check_password():
                             clear_processed_review_state()
                             st.rerun()
                 else:
-                    st.info("No records to commit.")
+                    st.info("No changes to commit - all results are already saved in the archive.")
+
+        elif st.session_state.get("unreachable_processed"):
+            # Every result of the search was unreachable: still show the list
+            st.write("---")
+            st.subheader("Processed Results")
+            st.write("All results of this search were unreachable. They were saved automatically.")
+            render_unreachable_list()
 
     # --- VIEW 4A: ADD/MANAGE KEYWORDS ---
     elif option == "🏷️ Add Keywords":
