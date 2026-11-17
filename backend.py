@@ -27,6 +27,19 @@ except Exception:
 HEBREW_WORD = re.compile(r"(?:[א-תװ-ײ][֑-ׇ]*){2,}")
 
 
+# Shared-hosting platforms: far too large to archive as a whole, so the main domain is
+# "Not relevant". Their subdomains (individual sites) are judged on their own by the keyword
+# process: they never inherit a status from the platform, and the platform never inherits one.
+# To add a platform, add its domain to this set.
+SHARED_HOSTING_DOMAINS = {
+    "wordpress.com", "blogspot.com", "github.io", "wixsite.com", "medium.com",
+    "substack.com", "tumblr.com", "weebly.com", "squarespace.com", "netlify.app",
+    "vercel.app", "herokuapp.com", "web.app", "pages.dev", "glitch.me",
+}
+
+_IP_ADDRESS = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+
+
 class ArchiveBackend:
 
     def __init__(self):
@@ -604,6 +617,10 @@ class ArchiveBackend:
 
         good_keywords, bad_keywords = self.get_keyword_lists()
         processed = []
+        # Parents are processed before their subdomains, so a subdomain can inherit the
+        # status of a parent found in the same search.
+        root_urls.sort(key=lambda u: (urlparse(u).hostname or "").count("."))
+        batch_statuses = {}
         # Per-search translation breaker: see _translate_to_english
         self._translation_breaker_active = True
         self._translation_failures = 0
@@ -617,11 +634,182 @@ class ArchiveBackend:
                     payload = self._note_translation_failure(self._mark_unreachable(payload))
                 else:
                     payload = self.evaluate_payload(payload, good_keywords=good_keywords, bad_keywords=bad_keywords)
+                    payload = self.apply_parent_status(payload, good_keywords, bad_keywords, batch_statuses)
+                    batch_statuses[self._host_of(payload.get("url") or "")] = payload.get("status")
                 processed.append(payload)
         finally:
             self._translation_breaker_active = False
 
         return processed
+
+    # =========================================================================
+    # PARENT DOMAINS AND SUBDOMAINS
+    # =========================================================================
+
+    def _host_of(self, url: str) -> str:
+        """Lower-case host of a url without a leading 'www.'."""
+        host = (urlparse(url if "://" in url else "http://" + url).hostname or "").lower()
+        return host[4:] if host.startswith("www.") else host
+
+    def _ancestor_hosts(self, host: str) -> list:
+        """Parent domains of a host, nearest first: a.b.yivo.org -> [b.yivo.org, yivo.org].
+
+        Single-label names (org) and shared-hosting platforms are never parents.
+        """
+        labels = host.split(".")
+        ancestors = [".".join(labels[i:]) for i in range(1, len(labels) - 1)]
+        return [a for a in ancestors if a not in SHARED_HOSTING_DOMAINS]
+
+    def find_parent_status(self, host: str, batch_statuses: dict | None = None):
+        """Status of the nearest saved parent domain: (parent_host, status), or None.
+
+        Rows of unreachable sites are ignored: their status describes a dead site, not a decision.
+        """
+        if not host or _IP_ADDRESS.match(host):
+            return None
+        ancestors = self._ancestor_hosts(host)
+        if not ancestors:
+            return None
+
+        urls = []
+        for a in ancestors:
+            urls += [a, f"http://{a}", f"https://{a}", f"http://www.{a}", f"https://www.{a}", f"www.{a}"]
+        saved = {}
+        try:
+            rows = (
+                self.supabase.table("DOMAINS")
+                .select("url,status,status_details")
+                .in_("url", urls)
+                .execute()
+                .data
+                or []
+            )
+        except Exception:
+            rows = []
+        for row in rows:
+            if "unreachable" in (row.get("status_details") or "").lower():
+                continue
+            saved.setdefault(self._host_of(row.get("url") or ""), row.get("status"))
+
+        for a in ancestors:
+            status = (batch_statuses or {}).get(a) or saved.get(a)
+            if status:
+                return a, status
+        return None
+
+    def _keyword_counts(self, payload: dict, good_keywords: list, bad_keywords: list) -> tuple:
+        """(good, bad) keyword match counts of a payload; Hebrew letters count as one good keyword."""
+        text = " ".join(
+            str(payload.get(k) or "") for k in ("title", "description", "title_english", "description_english")
+        ).lower()
+        good = self._count_keyword_matches(text, good_keywords)
+        bad = self._count_keyword_matches(text, bad_keywords)
+        if HEBREW_WORD.search(f"{payload.get('title') or ''} {payload.get('description') or ''}"):
+            good += 1
+        return good, bad
+
+    def _parent_decision(self, auto_status: str, good_count: int, bad_count: int, parent_status: str) -> str:
+        """Status a subdomain gets from its parent: the parent's status, or 'Not sure' on a conflict."""
+        if parent_status == "Approved":
+            if auto_status == "Approved":
+                return "Approved"
+            conflict = auto_status == "Not relevant" or bad_count > 0
+        else:  # parent is Not relevant
+            if auto_status == "Not relevant":
+                return "Not relevant"
+            conflict = auto_status == "Approved" or good_count > 0
+        return "Not sure" if conflict else parent_status
+
+    def apply_parent_status(self, payload: dict, good_keywords: list, bad_keywords: list, batch_statuses: dict | None = None) -> dict:
+        """Apply the shared-hosting rule and the parent-domain rule to an evaluated payload.
+
+        - The main domain of a shared-hosting platform is Not relevant.
+        - A subdomain whose nearest saved parent is Approved / Not relevant gets that status,
+          unless its own keywords disagree: then it is 'Not sure'.
+        - A parent that is 'Not sure' (or missing) passes nothing down.
+        """
+        host = self._host_of(payload.get("url") or "")
+        if host in SHARED_HOSTING_DOMAINS:
+            payload["status"] = "Not relevant"
+            payload["status_details"] = "Shared hosting platform"
+            return payload
+
+        found = self.find_parent_status(host, batch_statuses)
+        if not found or found[1] not in ("Approved", "Not relevant"):
+            return payload
+        parent_host, parent_status = found
+
+        good_count, bad_count = self._keyword_counts(payload, good_keywords, bad_keywords)
+        new_status = self._parent_decision(payload.get("status"), good_count, bad_count, parent_status)
+        original_details = payload.get("status_details") or ""
+        if new_status == parent_status:
+            prefix = f"Inherited from {parent_host} ({parent_status})"
+        else:
+            prefix = f"Conflicts with parent {parent_host} ({parent_status})"
+        payload["status"] = new_status
+        payload["status_details"] = f"{prefix}; {original_details}" if original_details else prefix
+        return payload
+
+    def cascade_status_to_subdomains(self, parent_url: str, parent_status: str, user: str | None = None) -> list:
+        """After a person sets a parent to Approved / Not relevant, pass that status down.
+
+        Only existing subdomains whose status is currently 'Not sure' change, and only when their
+        own keywords do not conflict. Subdomains with a nearer saved parent, and anything under a
+        shared-hosting platform's main domain, are left alone. Returns the urls that changed.
+        """
+        if parent_status not in ("Approved", "Not relevant"):
+            return []
+        host = self._host_of(parent_url)
+        if not host or _IP_ADDRESS.match(host) or host in SHARED_HOSTING_DOMAINS:
+            return []
+
+        rows = (
+            self.supabase.table("DOMAINS")
+            .select("*")
+            .ilike("url", f"%.{host}%")
+            .execute()
+            .data
+            or []
+        )
+        descendants = {}
+        for row in rows:
+            h = self._host_of(row.get("url") or "")
+            if h.endswith("." + host):
+                descendants[h] = row
+        if not descendants:
+            return []
+
+        good_keywords, bad_keywords = self.get_keyword_lists()
+        changed = []
+        for h, row in descendants.items():
+            if row.get("status") != "Not sure":
+                continue
+            # A nearer saved parent (between this subdomain and the changed parent) decides instead
+            nearer = [
+                a for a in self._ancestor_hosts(h)
+                if a != host and a in descendants
+                and "unreachable" not in (descendants[a].get("status_details") or "").lower()
+            ]
+            if nearer:
+                continue
+
+            payload = {
+                k: row.get(k)
+                for k in ("url", "title", "description", "title_english", "description_english", "languages")
+            }
+            payload = self.evaluate_payload(payload, good_keywords=good_keywords, bad_keywords=bad_keywords)
+            good_count, bad_count = self._keyword_counts(payload, good_keywords, bad_keywords)
+            if self._parent_decision(payload["status"], good_count, bad_count, parent_status) != parent_status:
+                continue  # conflicting keywords: stays 'Not sure'
+
+            updated = dict(row)
+            updated["status"] = parent_status
+            updated["status_details"] = f"Inherited from {host} ({parent_status})"
+            if user:
+                updated["user"] = user
+            self.insert_domain(updated)
+            changed.append(row.get("url"))
+        return changed
 
     def _is_unreachable(self, payload: dict) -> bool:
         """No response at all, 404, 410 or a server error (5xx). 403/401/429 count as reachable."""

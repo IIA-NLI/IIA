@@ -60,6 +60,20 @@ def resolve_status_details(
     return provided_details or fallback_details or ""
 
 
+def cascade_to_subdomains(url: str, status: str, user: str) -> None:
+    """After a person sets a parent domain to Approved / Not relevant, pass the status down to
+    its existing 'Not sure' subdomains (see ArchiveBackend.cascade_status_to_subdomains)."""
+    if status not in ("Approved", "Not relevant"):
+        return
+    try:
+        changed = backend.cascade_status_to_subdomains(url, status, user=user)
+        if changed:
+            shown = ", ".join(changed[:5]) + (" ..." if len(changed) > 5 else "")
+            st.toast(f"'{status}' was also applied to {len(changed)} subdomain(s): {shown}")
+    except Exception as cascade_err:
+        st.toast(f"Saved, but the status could not be applied to the subdomains: {cascade_err}")
+
+
 # --- AUTHENTICATION SHIELD ---
 def check_password():
     """Returns True if the user entered the correct password and a valid user name."""
@@ -422,6 +436,7 @@ if check_password():
                                 try:
                                     backend.insert_domain(payload)
                                     committed.append(payload["url"])
+                                    cascade_to_subdomains(payload["url"], payload["status"], session_user)
                                 except Exception as db_err:
                                     failed.append((payload.get("url"), str(db_err)))
 
@@ -601,6 +616,8 @@ if check_password():
                                         # Do not touch created_at here; backend will preserve it on upsert
                                         try:
                                             backend.insert_domain(updated_row)
+                                            if edited_status != previous_status:
+                                                cascade_to_subdomains(updated_row["url"], edited_status, session_user)
                                             if "adv_results" in st.session_state:
                                                 st.session_state["adv_results"] = [
                                                     updated_row if r.get("id") == updated_row.get("id") else r
@@ -861,6 +878,7 @@ if check_password():
                         continue
 
                     previous_status = updated_payload.get("status")
+                    updated_payload["_status_changed"] = status != previous_status
                     updated_payload["status"] = status
                     updated_payload["status_details"] = resolve_status_details(
                         updated_payload["status"],
@@ -894,6 +912,8 @@ if check_password():
                                 item["user"] = session_user
                                 backend.insert_domain(item)
                                 saved += 1
+                                if item.get("_status_changed"):
+                                    cascade_to_subdomains(item["url"], item["status"], session_user)
                             except Exception as e:
                                 st.error(f"Failed to save {item.get('url')}: {e}")
 
