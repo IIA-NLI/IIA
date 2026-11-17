@@ -56,7 +56,7 @@ def resolve_status_details(
     if status in {"Not relevant", "Not sure"}:
         return "Determined by user"
     if status == "Approved":
-        return provided_details or fallback_details or "Determined by user"
+        return "Determined by user"
     return provided_details or fallback_details or ""
 
 
@@ -423,7 +423,8 @@ if check_password():
                                     edited_status,
                                     edited_status_details,
                                     payload.get("status_details"),
-                                    status_changed=(edited_status != previous_status),
+                                    # Adding a URL by hand is always a decision made by the user
+                                    status_changed=True,
                                 )
                                 payload["title"] = edited_title or None
                                 payload["description"] = edited_description or None
