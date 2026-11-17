@@ -1,5 +1,6 @@
 import json
 import re
+import time
 import httpx
 from bs4 import BeautifulSoup
 from deep_translator import GoogleTranslator
@@ -19,6 +20,24 @@ try:
     from googleapiclient.discovery import build
 except Exception:
     build = None
+
+
+# A Hebrew word: 2 or more Hebrew letters in a row (niqqud allowed between them).
+# Includes the Yiddish ligatures, so Yiddish and Ladino text written in Hebrew script counts too.
+HEBREW_WORD = re.compile(r"(?:[א-תװ-ײ][֑-ׇ]*){2,}")
+
+
+# Shared-hosting platforms: far too large to archive as a whole, so the main domain is
+# "Not relevant". Their subdomains (individual sites) are judged on their own by the keyword
+# process: they never inherit a status from the platform, and the platform never inherits one.
+# To add a platform, add its domain to this set.
+SHARED_HOSTING_DOMAINS = {
+    "wordpress.com", "blogspot.com", "github.io", "wixsite.com", "medium.com",
+    "substack.com", "tumblr.com", "weebly.com", "squarespace.com", "netlify.app",
+    "vercel.app", "herokuapp.com", "web.app", "pages.dev", "glitch.me",
+}
+
+_IP_ADDRESS = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
 
 
 class ArchiveBackend:
@@ -169,22 +188,21 @@ class ArchiveBackend:
                 detected_langs = []
 
         # Translation Management
+        # Title and description are translated separately; a failure is retried once and
+        # is flagged (translation_failed) instead of being ignored silently. Text that
+        # already looks English is not sent to the translator.
         title_english = title
         description_english = description
-        dominant_lang = detected_langs[0] if detected_langs else "en"
+        translation_failed = False
 
-        if detected_langs and dominant_lang != "en":
-            try:
-                if title:
-                    title_english = GoogleTranslator(
-                        source="auto", target="en"
-                    ).translate(title)
-                if description:
-                    description_english = GoogleTranslator(
-                        source="auto", target="en"
-                    ).translate(description)
-            except Exception:
-                pass  
+        if combined_text and not self._looks_english(combined_text):
+            if title:
+                title_english, ok = self._translate_to_english(title)
+                translation_failed = translation_failed or not ok
+            if description:
+                description_english, ok = self._translate_to_english(description)
+                translation_failed = translation_failed or not ok
+            self._record_translation_result(translation_failed)
 
         return {
             "url": url,
@@ -199,7 +217,50 @@ class ArchiveBackend:
             "status_details": status_details,
             "source": "manually",
             "response_code": response_code,
+            "translation_failed": translation_failed,
         }
+
+    def _looks_english(self, text: str) -> bool:
+        """True when the language detector is confident that the text is English."""
+        try:
+            predictions = detect_langs(text)
+            return bool(predictions) and predictions[0].lang == "en" and predictions[0].prob > 0.9
+        except Exception:
+            return False
+
+    def _translate_to_english(self, text: str) -> tuple:
+        """Translate text to English. Returns (text, ok); on failure returns the original text and ok=False.
+
+        Retries once. While a search is running, translation is skipped for the rest of the
+        search after 3 pages in a row failed to translate, so an outage cannot slow it down.
+        """
+        in_search = getattr(self, "_translation_breaker_active", False)
+        if in_search and getattr(self, "_translation_failures", 0) >= 3:
+            return text, False
+
+        for attempt in range(2):
+            try:
+                translated = GoogleTranslator(source="auto", target="en").translate(text)
+                if translated:
+                    return translated, True
+            except Exception:
+                pass
+            if attempt == 0:
+                time.sleep(1)
+        return text, False
+
+    def _record_translation_result(self, failed: bool) -> None:
+        """Count consecutive pages whose translation failed (used by the per-search breaker)."""
+        if getattr(self, "_translation_breaker_active", False):
+            self._translation_failures = (getattr(self, "_translation_failures", 0) + 1) if failed else 0
+
+    def _note_translation_failure(self, payload: dict) -> dict:
+        """Add 'translation failed' to the status details of a page whose translation failed."""
+        if payload.get("translation_failed"):
+            details = payload.get("status_details") or ""
+            if "translation failed" not in details:
+                payload["status_details"] = f"{details}; translation failed" if details else "translation failed"
+        return payload
 
     def normalize_manual_url(self, url: str) -> tuple[str, str, bool, str]:
         """Normalize a URL and return a consistent domain key for manual ingestion.
@@ -338,19 +399,11 @@ class ArchiveBackend:
 
         if not language:
             language_code = "en"
+        elif re.match(r"^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,4})?$", language.strip()):
+            # Already a language code such as "he", "pt-BR" or "es-419"
+            language_code = language.strip()
         else:
-            if len(language) > 2 and not ("-" in language and len(language) <= 5):
-                language_code = self._lang_name_to_code(language)
-            else:
-                language_code = language
-
-        if not language:
-            language_code = "en"
-        else:
-            if len(language) > 2 and not ("-" in language and len(language) <= 5):
-                language_code = self._lang_name_to_code(language)
-            else:
-                language_code = language
+            language_code = self._lang_name_to_code(language)
 
         lang_for_hl = (language_code or "en")
         lang_for_lr = (language_code.split("-")[0].lower() if language_code else "en")
@@ -435,6 +488,13 @@ class ArchiveBackend:
                 good_matches = self._count_keyword_matches(normalized_text, good_keywords)
                 bad_matches = self._count_keyword_matches(normalized_text, bad_keywords)
 
+                # Hebrew letters (a word of 2+ letters; Yiddish/Ladino included) in the
+                # original title or description count as one good keyword.
+                original_text = f"{payload.get('title') or ''} {payload.get('description') or ''}"
+                hebrew_in_text = bool(HEBREW_WORD.search(original_text))
+                if hebrew_in_text:
+                    good_matches += 1
+
                 if good_matches > 0 and bad_matches > 0:
                     payload["status"] = "Not sure"
                     payload["status_details"] = f"{good_matches} good keyword{'s' if good_matches != 1 else ''} and {bad_matches} bad keyoword{'s' if good_matches != 1 else ''} matched"
@@ -450,11 +510,13 @@ class ArchiveBackend:
 
                 payload["matched_good_keywords"] = [kw for kw in good_keywords if kw.lower() in normalized_text]
                 payload["matched_bad_keywords"] = [kw for kw in bad_keywords if kw.lower() in normalized_text]
-                return payload
+                if hebrew_in_text:
+                    payload["matched_good_keywords"].append("Hebrew letters")
+                return self._note_translation_failure(payload)
 
         payload["matched_good_keywords"] = []
         payload["matched_bad_keywords"] = []
-        return payload
+        return self._note_translation_failure(payload)
 
     def _count_keyword_matches(self, text: str, keywords: list) -> int:
         text = text.lower()
@@ -490,6 +552,7 @@ class ArchiveBackend:
     ) -> list:
         """Run Google search for keyword list and return normalized, analyzed payloads for review."""
         all_links = []
+        self.last_search_errors = []
         for kw in keywords:
             query = f"inurl:{kw}" if include_inurl else kw
             try:
@@ -501,9 +564,16 @@ class ArchiveBackend:
                     date_from=date_from,
                     date_to=date_to,
                 )
-            except Exception:
+            except Exception as e:
+                # Remember the failure so the user is told about it (bad key, quota, ...)
+                self.last_search_errors.append((kw, str(e)))
                 links = []
             all_links.extend([(l, kw) for l in links])
+
+        if keywords and len(self.last_search_errors) == len(keywords):
+            raise RuntimeError(
+                f"Google search failed for every keyword. First error: {self.last_search_errors[0][1]}"
+            )
 
         seen_domain_keys = set()
         root_urls = []
@@ -547,15 +617,223 @@ class ArchiveBackend:
 
         good_keywords, bad_keywords = self.get_keyword_lists()
         processed = []
-        for link in root_urls:
-            payload = self.analyze_and_extract_url(link)
-            payload["link"] = domain_to_original_link.get(link, link)
-            if domain_to_keyword.get(link):
-                payload["source"] = f"Google search for {domain_to_keyword[link]}"
-            payload = self.evaluate_payload(payload, good_keywords=good_keywords, bad_keywords=bad_keywords)
-            processed.append(payload)
+        # Parents are processed before their subdomains, so a subdomain can inherit the
+        # status of a parent found in the same search.
+        root_urls.sort(key=lambda u: (urlparse(u).hostname or "").count("."))
+        batch_statuses = {}
+        # Per-search translation breaker: see _translate_to_english
+        self._translation_breaker_active = True
+        self._translation_failures = 0
+        try:
+            for link in root_urls:
+                payload = self.analyze_and_extract_url(link)
+                payload["link"] = domain_to_original_link.get(link, link)
+                if domain_to_keyword.get(link):
+                    payload["source"] = f"Google search for {domain_to_keyword[link]}"
+                if self._is_unreachable(payload):
+                    payload = self._note_translation_failure(self._mark_unreachable(payload))
+                else:
+                    payload = self.evaluate_payload(payload, good_keywords=good_keywords, bad_keywords=bad_keywords)
+                    payload = self.apply_parent_status(payload, good_keywords, bad_keywords, batch_statuses)
+                    batch_statuses[self._host_of(payload.get("url") or "")] = payload.get("status")
+                processed.append(payload)
+        finally:
+            self._translation_breaker_active = False
 
         return processed
+
+    # =========================================================================
+    # PARENT DOMAINS AND SUBDOMAINS
+    # =========================================================================
+
+    def _host_of(self, url: str) -> str:
+        """Lower-case host of a url without a leading 'www.'."""
+        host = (urlparse(url if "://" in url else "http://" + url).hostname or "").lower()
+        return host[4:] if host.startswith("www.") else host
+
+    def _ancestor_hosts(self, host: str) -> list:
+        """Parent domains of a host, nearest first: a.b.yivo.org -> [b.yivo.org, yivo.org].
+
+        Single-label names (org) and shared-hosting platforms are never parents.
+        """
+        labels = host.split(".")
+        ancestors = [".".join(labels[i:]) for i in range(1, len(labels) - 1)]
+        return [a for a in ancestors if a not in SHARED_HOSTING_DOMAINS]
+
+    def find_parent_status(self, host: str, batch_statuses: dict | None = None):
+        """Status of the nearest saved parent domain: (parent_host, status), or None.
+
+        Rows of unreachable sites are ignored: their status describes a dead site, not a decision.
+        """
+        if not host or _IP_ADDRESS.match(host):
+            return None
+        ancestors = self._ancestor_hosts(host)
+        if not ancestors:
+            return None
+
+        urls = []
+        for a in ancestors:
+            urls += [a, f"http://{a}", f"https://{a}", f"http://www.{a}", f"https://www.{a}", f"www.{a}"]
+        saved = {}
+        try:
+            rows = (
+                self.supabase.table("DOMAINS")
+                .select("url,status,status_details")
+                .in_("url", urls)
+                .execute()
+                .data
+                or []
+            )
+        except Exception:
+            rows = []
+        for row in rows:
+            if "unreachable" in (row.get("status_details") or "").lower():
+                continue
+            saved.setdefault(self._host_of(row.get("url") or ""), row.get("status"))
+
+        for a in ancestors:
+            status = (batch_statuses or {}).get(a) or saved.get(a)
+            if status:
+                return a, status
+        return None
+
+    def _keyword_counts(self, payload: dict, good_keywords: list, bad_keywords: list) -> tuple:
+        """(good, bad) keyword match counts of a payload; Hebrew letters count as one good keyword."""
+        text = " ".join(
+            str(payload.get(k) or "") for k in ("title", "description", "title_english", "description_english")
+        ).lower()
+        good = self._count_keyword_matches(text, good_keywords)
+        bad = self._count_keyword_matches(text, bad_keywords)
+        if HEBREW_WORD.search(f"{payload.get('title') or ''} {payload.get('description') or ''}"):
+            good += 1
+        return good, bad
+
+    def _parent_decision(self, auto_status: str, good_count: int, bad_count: int, parent_status: str) -> str:
+        """Status a subdomain gets from its parent: the parent's status, or 'Not sure' on a conflict."""
+        if parent_status == "Approved":
+            if auto_status == "Approved":
+                return "Approved"
+            conflict = auto_status == "Not relevant" or bad_count > 0
+        else:  # parent is Not relevant
+            if auto_status == "Not relevant":
+                return "Not relevant"
+            conflict = auto_status == "Approved" or good_count > 0
+        return "Not sure" if conflict else parent_status
+
+    def apply_parent_status(self, payload: dict, good_keywords: list, bad_keywords: list, batch_statuses: dict | None = None) -> dict:
+        """Apply the shared-hosting rule and the parent-domain rule to an evaluated payload.
+
+        - The main domain of a shared-hosting platform is Not relevant.
+        - A subdomain whose nearest saved parent is Approved / Not relevant gets that status,
+          unless its own keywords disagree: then it is 'Not sure'.
+        - A parent that is 'Not sure' (or missing) passes nothing down.
+        """
+        host = self._host_of(payload.get("url") or "")
+        if host in SHARED_HOSTING_DOMAINS:
+            payload["status"] = "Not relevant"
+            payload["status_details"] = "Shared hosting platform"
+            return payload
+
+        found = self.find_parent_status(host, batch_statuses)
+        if not found or found[1] not in ("Approved", "Not relevant"):
+            return payload
+        parent_host, parent_status = found
+
+        good_count, bad_count = self._keyword_counts(payload, good_keywords, bad_keywords)
+        new_status = self._parent_decision(payload.get("status"), good_count, bad_count, parent_status)
+        original_details = payload.get("status_details") or ""
+        if new_status == parent_status:
+            prefix = f"Inherited from {parent_host} ({parent_status})"
+        else:
+            prefix = f"Conflicts with parent {parent_host} ({parent_status})"
+        payload["status"] = new_status
+        payload["status_details"] = f"{prefix}; {original_details}" if original_details else prefix
+        return payload
+
+    def cascade_status_to_subdomains(self, parent_url: str, parent_status: str, user: str | None = None) -> list:
+        """After a person sets a parent to Approved / Not relevant, pass that status down.
+
+        Only existing subdomains whose status is currently 'Not sure' change, and only when their
+        own keywords do not conflict. Subdomains with a nearer saved parent, and anything under a
+        shared-hosting platform's main domain, are left alone. Returns the urls that changed.
+        """
+        if parent_status not in ("Approved", "Not relevant"):
+            return []
+        host = self._host_of(parent_url)
+        if not host or _IP_ADDRESS.match(host) or host in SHARED_HOSTING_DOMAINS:
+            return []
+
+        rows = (
+            self.supabase.table("DOMAINS")
+            .select("*")
+            .ilike("url", f"%.{host}%")
+            .execute()
+            .data
+            or []
+        )
+        descendants = {}
+        for row in rows:
+            h = self._host_of(row.get("url") or "")
+            if h.endswith("." + host):
+                descendants[h] = row
+        if not descendants:
+            return []
+
+        good_keywords, bad_keywords = self.get_keyword_lists()
+        changed = []
+        for h, row in descendants.items():
+            if row.get("status") != "Not sure":
+                continue
+            # A nearer saved parent (between this subdomain and the changed parent) decides instead
+            nearer = [
+                a for a in self._ancestor_hosts(h)
+                if a != host and a in descendants
+                and "unreachable" not in (descendants[a].get("status_details") or "").lower()
+            ]
+            if nearer:
+                continue
+
+            payload = {
+                k: row.get(k)
+                for k in ("url", "title", "description", "title_english", "description_english", "languages")
+            }
+            payload = self.evaluate_payload(payload, good_keywords=good_keywords, bad_keywords=bad_keywords)
+            good_count, bad_count = self._keyword_counts(payload, good_keywords, bad_keywords)
+            if self._parent_decision(payload["status"], good_count, bad_count, parent_status) != parent_status:
+                continue  # conflicting keywords: stays 'Not sure'
+
+            updated = dict(row)
+            updated["status"] = parent_status
+            updated["status_details"] = f"Inherited from {host} ({parent_status})"
+            if user:
+                updated["user"] = user
+            self.insert_domain(updated)
+            changed.append(row.get("url"))
+        return changed
+
+    def _is_unreachable(self, payload: dict) -> bool:
+        """No response at all, 404, 410 or a server error (5xx). 403/401/429 count as reachable."""
+        code = payload.get("response_code")
+        return code is None or code in (404, 410) or code >= 500
+
+    def _mark_unreachable(self, payload: dict) -> dict:
+        """Label an unreachable site: Not relevant, except .il sites which stay Approved."""
+        code = payload.get("response_code")
+        reason = "no response" if code is None else f"HTTP {code}"
+        hostname = (urlparse(payload.get("url") or "").hostname or "").lower()
+        if hostname.endswith(".il"):
+            payload["status"] = "Approved"
+            payload["status_details"] = f".il suffix; unreachable ({reason})"
+        else:
+            payload["status"] = "Not relevant"
+            payload["status_details"] = f"Unreachable ({reason})"
+        if isinstance(payload.get("languages"), dict):
+            # A failed fetch carries a fake {"error": ...} language; drop it
+            payload["languages"] = None
+        payload["matched_good_keywords"] = []
+        payload["matched_bad_keywords"] = []
+        payload["unreachable"] = True
+        return payload
 
     def domain_exists(self, domain_url: str) -> bool:
         """Check whether a domain already exists in `DOMAINS`."""
@@ -649,6 +927,33 @@ class ArchiveBackend:
             .execute()
         )
 
+    def insert_domains_batch(self, payloads: list) -> int:
+        """Save many NEW domain rows in a single request (used by the search auto-save).
+
+        Rows whose url already exists are left untouched (never overwritten).
+        Raises on failure so the caller can fall back to saving row by row.
+        """
+        now_iso = self._now_jerusalem_iso()
+        columns = [
+            "url", "title", "description", "title_english", "description_english",
+            "languages", "status", "status_details", "response_code", "source", "user",
+        ]
+        rows = {}
+        for payload in payloads:
+            if not payload.get("url"):
+                continue
+            row = {col: payload.get(col) for col in columns}
+            row["created_at"] = now_iso
+            row["updated_at"] = now_iso
+            rows[row["url"]] = row
+        if rows:
+            (
+                self.supabase.table("DOMAINS")
+                .upsert(list(rows.values()), on_conflict="url", ignore_duplicates=True)
+                .execute()
+            )
+        return len(rows)
+
     def get_all_domains(self) -> list:
         """Fetches all records from the DOMAINS database table."""
         response = (
@@ -661,44 +966,66 @@ class ArchiveBackend:
 
     def search_domains(self, query: str) -> list:
         """Queries the database looking for a keyword string across multiple columns."""
-        match_str = f"%{query}%"
-        response = (
-            self.supabase.table("DOMAINS")
-            .select("*")
-            .or_(
-                f"url.ilike.{match_str},title.ilike.{match_str},description.ilike.{match_str},title_english.ilike.{match_str},description_english.ilike.{match_str}"
+        # Commas, parentheses and line breaks separate the search into several
+        # terms; each term is searched in turn and the results are combined.
+        rows_by_id = {}
+        for term in self._split_search_terms(query):
+            match_str = f"%{term}%"
+            response = (
+                self.supabase.table("DOMAINS")
+                .select("*")
+                .or_(
+                    f"url.ilike.{match_str},title.ilike.{match_str},description.ilike.{match_str},title_english.ilike.{match_str},description_english.ilike.{match_str}"
+                )
+                .order("id", desc=True)
+                .execute()
             )
-            .order("id", desc=True)
-            .execute()
-        )
-        return response.data
+            for row in response.data or []:
+                rows_by_id.setdefault(row["id"], row)
+        return sorted(rows_by_id.values(), key=lambda r: r["id"], reverse=True)
+
+    def _split_search_terms(self, query: str) -> list:
+        """Split search text on commas, parentheses and line breaks."""
+        return [t.strip() for t in re.split(r"[,()\n]+", query or "") if t.strip()]
 
     def advanced_search_domains(self, filters: dict) -> list:
         """Executes a compound multi-column advanced filter search query."""
-        query_builder = self.supabase.table("DOMAINS").select("*")
+        # Each text term (split on commas, parentheses, line breaks) is searched
+        # separately with the other filters applied, and the results are combined.
+        terms = self._split_search_terms(filters.get("text_query")) or [None]
+        rows_by_id = {}
+        for term in terms:
+            query_builder = self.supabase.table("DOMAINS").select("*")
 
-        if filters.get("text_query"):
-            match_str = f"%{filters['text_query']}%"
-            query_builder = query_builder.or_(
-                f"url.ilike.{match_str},title.ilike.{match_str},description.ilike.{match_str},title_english.ilike.{match_str},description_english.ilike.{match_str}"
-            )
+            if term:
+                match_str = f"%{term}%"
+                query_builder = query_builder.or_(
+                    f"url.ilike.{match_str},title.ilike.{match_str},description.ilike.{match_str},title_english.ilike.{match_str},description_english.ilike.{match_str}"
+                )
 
-        if filters.get("status"):
-            query_builder = query_builder.eq("status", filters["status"])
-            
-        if filters.get("response_code"):
-            query_builder = query_builder.eq("response_code", filters["response_code"])
+            if filters.get("status"):
+                query_builder = query_builder.eq("status", filters["status"])
 
-        response = query_builder.order("id", desc=True).execute()
-        data = response.data
+            if filters.get("response_code"):
+                query_builder = query_builder.eq("response_code", filters["response_code"])
+
+            response = query_builder.order("id", desc=True).execute()
+            for row in response.data or []:
+                rows_by_id.setdefault(row["id"], row)
+        data = sorted(rows_by_id.values(), key=lambda r: r["id"], reverse=True)
 
         if filters.get("language") and data:
-            target_lang = filters["language"].lower()
+            target_lang = filters["language"].strip().lower()
+            # Accept both a name ("Hebrew") and a code ("he"): a code is also
+            # matched against its language name, since names are what is stored.
+            wanted_langs = {target_lang}
+            if re.match(r"^[a-z]{2,3}(-[a-z0-9]{2,4})?$", target_lang):
+                wanted_langs.add(self._lang_code_to_name(target_lang).lower())
             data = [
                 row for row in data
                 if (
-                    (isinstance(row.get("languages"), dict) and target_lang in row["languages"])
-                    or (isinstance(row.get("languages"), list) and any(str(lang).lower() == target_lang for lang in row.get("languages", [])))
+                    (isinstance(row.get("languages"), dict) and any(str(lang).lower() in wanted_langs for lang in row["languages"]))
+                    or (isinstance(row.get("languages"), list) and any(str(lang).lower() in wanted_langs for lang in row.get("languages", [])))
                 )
             ]
 
