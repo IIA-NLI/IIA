@@ -784,6 +784,9 @@ class ArchiveBackend:
         for h, row in descendants.items():
             if row.get("status") != "Not sure":
                 continue
+            # A status set by a person is never overwritten
+            if "determined by user" in (row.get("status_details") or "").lower():
+                continue
             # A nearer saved parent (between this subdomain and the changed parent) decides instead
             nearer = [
                 a for a in self._ancestor_hosts(h)
@@ -975,7 +978,7 @@ class ArchiveBackend:
                 self.supabase.table("DOMAINS")
                 .select("*")
                 .or_(
-                    f"url.ilike.{match_str},title.ilike.{match_str},description.ilike.{match_str},title_english.ilike.{match_str},description_english.ilike.{match_str}"
+                    f"url.ilike.{match_str},title.ilike.{match_str},description.ilike.{match_str},title_english.ilike.{match_str},description_english.ilike.{match_str},status_details.ilike.{match_str}"
                 )
                 .order("id", desc=True)
                 .execute()
@@ -1000,7 +1003,7 @@ class ArchiveBackend:
             if term:
                 match_str = f"%{term}%"
                 query_builder = query_builder.or_(
-                    f"url.ilike.{match_str},title.ilike.{match_str},description.ilike.{match_str},title_english.ilike.{match_str},description_english.ilike.{match_str}"
+                    f"url.ilike.{match_str},title.ilike.{match_str},description.ilike.{match_str},title_english.ilike.{match_str},description_english.ilike.{match_str},status_details.ilike.{match_str}"
                 )
 
             if filters.get("status"):
